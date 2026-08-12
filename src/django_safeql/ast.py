@@ -56,9 +56,16 @@ ARITHMETIC_OPS = {
 }
 
 
+# Untrusted input guard: a query longer than this is rejected before parsing,
+# bounding the work (and stack depth) a single query can demand.
+MAX_SQL_LENGTH = 100_000
+
+
 class SQLGlotParser:
 
     def parse(self, sql: str) -> Query:
+        if len(sql) > MAX_SQL_LENGTH:
+            raise UnsupportedSQL(f"SQL exceeds the maximum supported length of {MAX_SQL_LENGTH} characters")
         tree = sqlglot.parse_one(sql, read="postgres")
         return self.visit(tree)
 

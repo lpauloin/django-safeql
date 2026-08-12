@@ -25,6 +25,21 @@ _CANONICAL_CAST_TYPES = {
 }
 
 
+# Canonical cast type -> the concrete PostgreSQL type to emit in raw SQL. The
+# canonical names are internal (some, like "datetime"/"string", are not valid
+# PostgreSQL type names), so they must be translated before hitting a ``::`` cast.
+_POSTGRES_CAST_TYPES = {
+    "integer": "integer",
+    "float": "double precision",
+    "decimal": "numeric",
+    "boolean": "boolean",
+    "date": "date",
+    "datetime": "timestamp",
+    "string": "text",
+    "json": "jsonb",
+}
+
+
 def normalize_cast_type(type_name: str) -> str | None:
     """Return the canonical cast type for ``type_name``, or ``None`` if unsupported."""
     value = re.sub(r"\s+", " ", type_name.lower().strip())
@@ -34,3 +49,8 @@ def normalize_cast_type(type_name: str) -> str | None:
         if value in aliases:
             return canonical
     return None
+
+
+def postgres_cast_type(canonical: str) -> str:
+    """Translate a canonical cast type to the PostgreSQL type name to emit in ``::`` casts."""
+    return _POSTGRES_CAST_TYPES[canonical]

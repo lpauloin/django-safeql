@@ -182,6 +182,20 @@ def test_lateral_inner_where_in_values(library):
     assert rows[library.d3.id] == "Charles Babbage"
 
 
+def test_jsonb_array_elements_cast_emits_valid_postgres_type(library):
+    # Canonical cast names ("datetime"/"string") are not valid PostgreSQL types;
+    # the SRF path must translate them (timestamp/text) before the ``::`` cast.
+    qs = library.transpiler.to_queryset("""
+        SELECT book.id, MAX((item->>'amount')::timestamp) AS ts
+        FROM book
+        LEFT JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item ON true
+        GROUP BY book.id
+    """)
+    sql, _ = qs.query.sql_with_params()
+    assert "::timestamp" in sql
+    assert "::datetime" not in sql
+
+
 def test_lateral_correlated_with_not_condition(library):
     # _find_correlated_field must traverse Not nodes.
     qs = library.transpiler.to_queryset("""

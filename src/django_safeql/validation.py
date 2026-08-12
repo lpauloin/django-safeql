@@ -344,6 +344,8 @@ class ValidationVisitor(Visitor):
             )
 
     def _validate_subquery_body(self, subquery: Query):
+        # Same fail-closed node-type whitelist as the main query.
+        self._check_node_types(subquery)
         # These clauses are accepted by the parser but never applied by codegen
         # (_build_inner_queryset only ever honours WHERE and ORDER BY) — rejecting
         # them here turns a silently-wrong query into a clear error instead.

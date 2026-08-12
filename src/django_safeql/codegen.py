@@ -60,7 +60,7 @@ from django.db.models.functions import (
     Upper,
 )
 
-from django_safeql.casts import normalize_cast_type
+from django_safeql.casts import normalize_cast_type, postgres_cast_type
 from django_safeql.literals import literal_value
 from django_safeql.nodes import (
     Aggregate,
@@ -131,7 +131,7 @@ class JsonbArrayAggFunc(Func):
 
     def as_sql(self, compiler, connection, **extra_context):
         source_sql, params = compiler.compile(self.source_expressions[0])
-        cast = f"::{self._cast_type}" if self._cast_type else ""
+        cast = f"::{postgres_cast_type(self._cast_type)}" if self._cast_type else ""
         extra_params: list = []
         if self._fn_name == "jsonb_array_elements_text":
             val = f"elem{cast}"
