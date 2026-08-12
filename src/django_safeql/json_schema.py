@@ -8,18 +8,11 @@ class JsonSchemaResolver:
         return current
 
     def _resolve_part(self, schema, part):
+        # anyOf/oneOf/allOf: the part may be defined in any branch — return the
+        # first branch that resolves it.
         for key in ("anyOf", "oneOf", "allOf"):
             if key in schema:
-                candidates = schema[key]
-                if key == "allOf":
-                    # Merge all allOf branches and resolve in the merged result
-                    merged = {}
-                    for branch in candidates:
-                        resolved = self._resolve_part(branch, part)
-                        if resolved is not None:
-                            return resolved
-                    return None
-                for candidate in candidates:
+                for candidate in schema[key]:
                     resolved = self._resolve_part(candidate, part)
                     if resolved is not None:
                         return resolved
