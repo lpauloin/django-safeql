@@ -178,6 +178,9 @@ class AnnotationVisitor(Visitor):
                 outer_table_name = outer_alias_to_table[node.table]
                 outer_table_schema = self.schema.get_table(outer_table_name)
                 if outer_table_schema:
+                    if not self._field_allowed(outer_table_schema, node.name):
+                        node.annotations["error"] = f"Unknown field: {outer_table_name}.{node.name}"
+                        return node
                     outer_rel = outer_table_schema.relation
                     outer_django_path = f"{outer_rel}__{node.name}" if outer_rel else node.name
                     node.annotations.update(
@@ -220,20 +223,9 @@ class AnnotationVisitor(Visitor):
             node.annotations["error"] = f"Unknown table for column: {node.table}"
             return node
         json_field_names = set(table_schema.json_fields.keys())
-        if table_schema.allowed_fields is not None:
-            if node.name not in table_schema.allowed_fields:
-                node.annotations["error"] = f"Unknown field: {sql_table}.{node.name}"
-                return node
-        else:
-            model_field_names = {f.name for f in table_schema.model._meta.get_fields()}
-            db_column_names = {getattr(f, "column", None) for f in table_schema.model._meta.fields}
-            if (
-                node.name not in model_field_names
-                and node.name not in db_column_names
-                and node.name not in json_field_names
-            ):
-                node.annotations["error"] = f"Unknown field: {sql_table}.{node.name}"
-                return node
+        if not self._field_allowed(table_schema, node.name):
+            node.annotations["error"] = f"Unknown field: {sql_table}.{node.name}"
+            return node
         relation = table_schema.relation
         # Inside a lateral subquery, the inner table has no relation prefix.
         if self.scope.get("is_lateral_subquery") and sql_table == self.scope.get("inner_table_name"):
@@ -320,3 +312,18 @@ class AnnotationVisitor(Visitor):
         if not table:
             return self.schema.base_table
         return self.scope.get("alias_to_table", {}).get(table, table)
+
+    def _field_allowed(self, table_schema: TableSchema, field_name: str) -> bool:
+        """Whether field_name is reachable on table_schema per its whitelist.
+
+        Used both for plain column references and for outer-table references made
+        from inside a LATERAL/EXISTS subquery — both must be checked against the
+        same whitelist, or the subquery correlation becomes a way to reach fields
+        the schema never declared.
+        """
+        if table_schema.allowed_fields is not None:
+            return field_name in table_schema.allowed_fields
+        model_field_names = {f.name for f in table_schema.model._meta.get_fields()}
+        db_column_names = {getattr(f, "column", None) for f in table_schema.model._meta.fields}
+        json_field_names = set(table_schema.json_fields.keys())
+        return field_name in model_field_names or field_name in db_column_names or field_name in json_field_names

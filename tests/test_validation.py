@@ -109,6 +109,28 @@ class SQLLateralValidationTestCase(TestCase):
                 ) AS pinfo ON true
             """)
 
+    def test_lateral_rejects_unwhitelisted_outer_field_in_where(self):
+        # Regression test: an outer-table column referenced from inside a LATERAL
+        # subquery's WHERE clause must be checked against the outer table's
+        # allowed_fields, just like any other column reference.
+        with self.assertRaisesRegex(ValidationError, "Unknown field: book.print_run"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                LEFT JOIN LATERAL (
+                    SELECT p.name FROM author p WHERE p.id = book.print_run LIMIT 1
+                ) AS pinfo ON true
+            """)
+
+    def test_exists_rejects_unwhitelisted_outer_field_in_where(self):
+        # Same bypass, via EXISTS instead of LATERAL.
+        with self.assertRaisesRegex(ValidationError, "Unknown field: book.print_run"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                WHERE EXISTS (
+                    SELECT 1 FROM author p WHERE p.id = book.print_run
+                )
+            """)
+
     def test_exists_rejects_unknown_inner_table(self):
         with self.assertRaisesRegex(ValidationError, "Unknown table"):
             self.transpiler.to_ast("""
