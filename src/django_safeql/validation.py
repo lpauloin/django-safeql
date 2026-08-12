@@ -18,18 +18,19 @@ from django_safeql.nodes import (
     CastExpr,
     Column,
     ExistsExpr,
+    From,
     FunctionCall,
+    Join,
     JsonContains,
     JsonHasAllKeys,
     JsonHasAnyKeys,
     JsonHasKey,
     JsonPath,
     LateralJoin,
-    Node,
     Query,
     Select,
 )
-from django_safeql.schemas import SQLTranspilerSchema
+from django_safeql.schemas import SQLTranspilerSchema, TableSchema
 from django_safeql.visitor import Visitor
 
 # None = any arity; int = exact; tuple = (min, max) where max=None means unbounded
@@ -89,11 +90,6 @@ class ValidationVisitor(Visitor):
     def __init__(self, schema: SQLTranspilerSchema):
         self.schema = schema
 
-    def generic_visit(self, node: Node, *args, **kwargs):
-        if node.annotations.get("error"):
-            raise ValidationError(node.annotations["error"])
-        return super().generic_visit(node, *args, **kwargs)
-
     def visit_Query(self, node: Query):
         if not node.from_:
             raise ValidationError("Missing FROM clause")
@@ -107,6 +103,56 @@ class ValidationVisitor(Visitor):
         self._check_lateral_srf_usage(node)
         self._check_aggregation(node)
         return node
+
+    # -- Schema resolution decisions ---------------------------------------
+    #
+    # Annotation attaches the resolved facts (table_schema, sql_table, cast_type,
+    # json_field_schema, …), leaving them None when it could not resolve. These
+    # methods read those facts and decide whether the query is allowed.
+
+    def visit_From(self, node: From):
+        if node.annotations.get("table_schema") is None:
+            raise ValidationError(f"Unknown table: {node.table}")
+        if node.table != self.schema.base_table:
+            raise ValidationError(f"FROM must use base table {self.schema.base_table!r}")
+        return node
+
+    def visit_Join(self, node: Join):
+        if node.annotations.get("table_schema") is None:
+            raise ValidationError(f"Unknown table: {node.table}")
+        self.visit(node.on)
+        return node
+
+    def visit_Column(self, node: Column):
+        if node.annotations.get("is_outer_ref"):
+            table_schema = node.annotations["outer_table_schema"]
+            field_name = node.annotations["outer_field_name"]
+            if not self._field_allowed(table_schema, field_name):
+                raise ValidationError(f"Unknown field: {node.annotations['outer_table_name']}.{field_name}")
+            return node
+        if node.annotations.get("is_lateral_ref") or node.annotations.get("select_alias"):
+            return node
+        table_schema = node.annotations.get("table_schema")
+        if table_schema is None:
+            raise ValidationError(f"Unknown table for column: {node.table}")
+        if node.name != "*" and not self._field_allowed(table_schema, node.name):
+            raise ValidationError(f"Unknown field: {node.annotations['sql_table']}.{node.name}")
+        return node
+
+    def visit_CastExpr(self, node: CastExpr):
+        if node.annotations.get("cast_type") is None:
+            raise ValidationError(f"Unsupported cast type: {node.target_type}")
+        self.visit(node.expression)
+        return node
+
+    def _field_allowed(self, table_schema: TableSchema, field_name: str) -> bool:
+        """Whether ``field_name`` is reachable on ``table_schema`` per its whitelist."""
+        if table_schema.allowed_fields is not None:
+            return field_name in table_schema.allowed_fields
+        model_field_names = {f.name for f in table_schema.model._meta.get_fields()}
+        db_column_names = {getattr(f, "column", None) for f in table_schema.model._meta.fields}
+        json_field_names = set(table_schema.json_fields.keys())
+        return field_name in model_field_names or field_name in db_column_names or field_name in json_field_names
 
     # -- LATERAL set-returning-function usage ------------------------------
     #
@@ -278,11 +324,28 @@ class ValidationVisitor(Visitor):
         return node
 
     def visit_JsonPath(self, node: JsonPath):
+        self.visit(node.base)
         if node.annotations.get("is_lateral_path"):
             return node  # Lateral element paths are not validated against the schema
+        if node.annotations.get("json_base_is_outer_ref"):
+            raise ValidationError(
+                "JSON path access on a reference to the outer query's table is not "
+                "supported inside LATERAL/EXISTS subqueries"
+            )
         if not node.path:
             raise ValidationError("Empty JSON path is not supported")
-        return self.generic_visit(node)
+        if "json_field_schema" not in node.annotations:
+            return node  # base did not resolve to a table column; visit(base) reported it
+        json_field_schema = node.annotations["json_field_schema"]
+        if json_field_schema is None:
+            raise ValidationError(f"Field is not declared as JSON: {node.base.name}")
+        if (
+            node.annotations.get("json_path_schema") is None
+            and json_field_schema.strict
+            and not json_field_schema.allow_unknown_paths
+        ):
+            raise ValidationError(f"Unknown JSON path: {node.base.name}.{'.'.join(map(str, node.path))}")
+        return node
 
     def visit_JsonContains(self, node: JsonContains):
         self.visit(node.left)
@@ -360,21 +423,21 @@ class ValidationVisitor(Visitor):
             raise ValidationError("LATERAL requires a subquery body")
         if not node.alias:
             raise ValidationError("LATERAL JOIN must have an alias (AS <name>)")
-        if node.annotations.get("error"):
-            raise ValidationError(node.annotations["error"])
-        if node.subquery.annotations.get("error"):
-            raise ValidationError(node.subquery.annotations["error"])
+        self._check_subquery_inner_table(node.subquery)
         self._validate_subquery_body(node.subquery)
         return node
 
     def visit_ExistsExpr(self, node: ExistsExpr):
-        if node.annotations.get("error"):
-            raise ValidationError(node.annotations["error"])
-        if node.subquery and node.subquery.annotations.get("error"):
-            raise ValidationError(node.subquery.annotations["error"])
         if node.subquery:
+            self._check_subquery_inner_table(node.subquery)
             self._validate_subquery_body(node.subquery)
         return node
+
+    def _check_subquery_inner_table(self, subquery: Query):
+        if subquery.annotations.get("inner_table_schema") is None:
+            raise ValidationError(
+                f"Unknown table in LATERAL subquery: {subquery.annotations.get('inner_table_name')!r}"
+            )
 
     def _validate_subquery_body(self, subquery: Query):
         # These clauses are accepted by the parser but never applied by codegen
