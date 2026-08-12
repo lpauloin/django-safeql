@@ -173,58 +173,45 @@ class ValidationVisitor(Visitor):
     #
     # SQL-standard rule: in an aggregated query (one with a GROUP BY, or with an
     # aggregate anywhere in SELECT), every non-aggregate expression in SELECT,
-    # HAVING and ORDER BY must be "covered" by the GROUP BY — it is one of the
-    # GROUP BY expressions, or every column leaf it references (outside of an
-    # aggregate) appears in the GROUP BY. Anything else is rejected here instead
-    # of being silently reinterpreted downstream (dropped column, HAVING folded
-    # into WHERE, or the GROUP BY silently widened).
+    # HAVING and ORDER BY must be "covered" by the GROUP BY — it is itself one of
+    # the GROUP BY expressions (annotation marked it is_grouped), or every column
+    # it references outside an aggregate (column_leaves) is a grouped column.
+    # Anything else is rejected here instead of being silently reinterpreted
+    # downstream (dropped column, HAVING folded into WHERE, GROUP BY widened).
 
     def _check_aggregation(self, node: Query):
         if not (node.group_by or _select_has_aggregate(node.select)):
             return
-        grouped_keys, grouped_leaves = self._grouping_sets(node)
+        grouped_columns = node.annotations.get("grouped_columns", set())
 
         for item in node.select.columns if node.select else []:
             expr = item.expression if isinstance(item, Alias) else item
-            if not self._covered(expr, grouped_keys, grouped_leaves):
-                label = self._ungrouped_label(expr, grouped_leaves)
+            if not self._covered(expr, grouped_columns):
+                label = self._ungrouped_column(expr, grouped_columns)
                 raise ValidationError(
                     f"Column {label!r} must appear in GROUP BY or be used in an aggregate function"
                     if label
                     else "SELECT expression must appear in GROUP BY or be used in an aggregate function"
                 )
 
-        if node.having is not None and not self._covered(node.having, grouped_keys, grouped_leaves):
+        if node.having is not None and not self._covered(node.having, grouped_columns):
             raise ValidationError("HAVING may only reference aggregates or GROUP BY expressions")
 
         for order in node.order_by:
-            if not self._covered(order.expression, grouped_keys, grouped_leaves):
+            if not self._covered(order.expression, grouped_columns):
                 raise ValidationError(
                     "ORDER BY may only reference aggregates or GROUP BY expressions in an aggregated query"
                 )
 
-    def _grouping_sets(self, node: Query):
-        grouped_keys: set = set()
-        grouped_leaves: set = set()
-        for group_expr in node.group_by:
-            key = group_expr.annotations["expr_key"]
-            grouped_keys.add(key)
-            # A group key that is a plain column reference makes that column covered
-            # wherever it appears; grouping by an expression does not (only exact
-            # matches of the expression are covered, via grouped_keys).
-            if key[0] == "col":
-                grouped_leaves.add(key)
-        return grouped_keys, grouped_leaves
-
-    def _covered(self, expr, grouped_keys: set, grouped_leaves: set) -> bool:
-        if expr.annotations["expr_key"] in grouped_keys:
+    def _covered(self, expr, grouped_columns: set) -> bool:
+        if expr.annotations.get("is_grouped"):
             return True
-        return all(leaf in grouped_leaves for leaf in expr.annotations["column_leaves"])
+        return all(leaf in grouped_columns for leaf in expr.annotations["column_leaves"])
 
-    def _ungrouped_label(self, expr, grouped_leaves: set):
+    def _ungrouped_column(self, expr, grouped_columns: set):
         for leaf in expr.annotations["column_leaves"]:
-            if leaf not in grouped_leaves:
-                return leaf[1] if len(leaf) == 2 else ".".join(p for p in leaf[1:] if p)
+            if leaf not in grouped_columns:
+                return leaf
         return None
 
     def visit_BinaryOp(self, node: BinaryOp):

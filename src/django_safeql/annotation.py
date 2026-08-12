@@ -1,20 +1,6 @@
+from django_safeql import nodes
 from django_safeql.casts import normalize_cast_type
 from django_safeql.json_schema import json_schema_type, JsonSchemaResolver
-from django_safeql.nodes import (
-    Aggregate,
-    Alias,
-    ArithmeticOp,
-    CaseExpr,
-    CastExpr,
-    Column,
-    ExistsExpr,
-    From,
-    FunctionCall,
-    Join,
-    JsonPath,
-    LateralJoin,
-    Query,
-)
 from django_safeql.schemas import SQLTranspilerSchema
 from django_safeql.scope import ScopeStack
 from django_safeql.visitor import Visitor
@@ -36,13 +22,18 @@ class AnnotationVisitor(Visitor):
         self.json_resolver = JsonSchemaResolver()
 
     def visit(self, node, *args, **kwargs):
-        # Every visited node announces its type to the recording (sub)query scope,
-        # so each query knows exactly what it is made of (see ScopeStack.record_types).
-        if node is not None:
-            self.scope.announce(type(node))
-        return super().visit(node, *args, **kwargs)
+        if node is None:
+            return None
+        # On the way down: announce the node's type to the recording (sub)query
+        # scope, so each query knows exactly what it is made of.
+        self.scope.announce(type(node))
+        result = super().visit(node, *args, **kwargs)
+        # On the way back up: now that the children are annotated, record which
+        # columns this node references outside an aggregate (for GROUP BY coverage).
+        self._record_column_leaves(node)
+        return result
 
-    def visit_Query(self, node: Query):
+    def visit_Query(self, node: nodes.Query):
         with self.scope.scoped(node, alias_to_table={}, select_aliases={}, lateral_aliases={}):
             self.scope.record_types()
             self.visit(node.from_)
@@ -52,6 +43,9 @@ class AnnotationVisitor(Visitor):
             self.visit(node.where)
             for expression in node.group_by:
                 self.visit(expression)
+            # GROUP BY is resolved before HAVING/ORDER so an alias reference there
+            # sees its target already marked as grouped.
+            node.annotations["grouped_columns"] = self._mark_grouped(node)
             self.visit(node.having)
             for order in node.order_by:
                 self.visit(order)
@@ -59,26 +53,24 @@ class AnnotationVisitor(Visitor):
             node.annotations["base_model"] = self.schema.base_model
             node.annotations["select_aliases"] = dict(self.scope.get("select_aliases", {}))
             node.annotations["node_types"] = set(self.scope.types())
-            self._annotate_aggregation_facts(node)
         return node
 
-    def visit_From(self, node: From):
+    def visit_From(self, node: nodes.From):
         self._annotate_table_node(node)
         return node
 
-    def visit_Join(self, node: Join):
+    def visit_Join(self, node: nodes.Join):
         self._annotate_table_node(node)
         self.visit(node.on)
         return node
 
-    def visit_LateralJoin(self, node: LateralJoin):
+    def visit_LateralJoin(self, node: nodes.LateralJoin):
         if node.fn_call:
             for arg in node.fn_call.args:
                 self.visit(arg)
             node.annotations["fn_name"] = node.fn_call.name.lower()
         elif node.subquery:
-            outer_alias_to_table = dict(self.scope.get("alias_to_table", {}))
-            self._visit_lateral_subquery(node.subquery, outer_alias_to_table)
+            self._visit_lateral_subquery(node.subquery)
             node.annotations.update(
                 {
                     "inner_model": node.subquery.annotations.get("inner_model"),
@@ -91,24 +83,18 @@ class AnnotationVisitor(Visitor):
         node.annotations["alias"] = node.alias
         return node
 
-    def _visit_lateral_subquery(self, subquery: "Query", outer_alias_to_table: dict):
+    def _visit_lateral_subquery(self, subquery: nodes.Query):
         """Annotate the inner query of a lateral/exists join, detecting outer references."""
         if not subquery.from_:
             return
+        outer_alias_to_table = dict(self.scope.get("alias_to_table", {}))
         inner_table_name = subquery.from_.table
         inner_alias = subquery.from_.alias or inner_table_name
-        inner_table_schema = self.schema.get_table(inner_table_name)
+        inner_table_schema = self._attach_table(subquery.from_, inner_table_name)
         subquery.annotations["inner_table_name"] = inner_table_name
         subquery.annotations["inner_table_schema"] = inner_table_schema
         if inner_table_schema is None:
             return
-        subquery.from_.annotations.update(
-            {
-                "table_schema": inner_table_schema,
-                "model": inner_table_schema.model,
-                "relation": inner_table_schema.relation,
-            }
-        )
         inner_alias_to_table = {inner_table_name: inner_table_name}
         if inner_alias != inner_table_name:
             inner_alias_to_table[inner_alias] = inner_table_name
@@ -138,37 +124,42 @@ class AnnotationVisitor(Visitor):
             }
         )
 
-    def visit_ExistsExpr(self, node: "ExistsExpr"):
+    def visit_ExistsExpr(self, node: nodes.ExistsExpr):
         if node.subquery:
-            outer_alias_to_table = dict(self.scope.get("alias_to_table", {}))
-            self._visit_lateral_subquery(node.subquery, outer_alias_to_table)
+            self._visit_lateral_subquery(node.subquery)
             node.annotations.update(node.subquery.annotations)
         return node
 
-    def _annotate_table_node(self, node: From | Join):
-        table_schema = self.schema.get_table(node.table)
-        node.annotations["table_schema"] = table_schema
+    def _attach_table(self, node, sql_table):
+        """Resolve a table name against the schema and record the shared facts.
+
+        Used for every table reference — FROM, JOIN, and columns — so the
+        ``table_schema``/``model``/``relation`` facts are produced in one place.
+        """
+        table_schema = self.schema.get_table(sql_table)
+        node.annotations.update({"sql_table": sql_table, "table_schema": table_schema})
         if table_schema is not None:
             node.annotations.update({"model": table_schema.model, "relation": table_schema.relation})
+        return table_schema
+
+    def _annotate_table_node(self, node: nodes.From | nodes.Join):
+        self._attach_table(node, node.table)
         alias_to_table = self.scope.mutate_mapping("alias_to_table")
         alias_to_table[node.table] = node.table
         if node.alias:
             alias_to_table[node.alias] = node.table
 
-    def visit_Alias(self, node: Alias):
+    def visit_Alias(self, node: nodes.Alias):
         self.visit(node.expression)
         select_aliases = self.scope.mutate_mapping("select_aliases")
         select_aliases[node.alias] = node.expression
         node.annotations["alias"] = node.alias
         return node
 
-    def visit_Column(self, node: Column):
+    def visit_Column(self, node: nodes.Column):
         if node.name == "*":
-            sql_table = self._resolve_table(node.table)
-            table_schema = self.schema.get_table(sql_table)
-            node.annotations.update({"sql_table": sql_table, "table_schema": table_schema, "django_path": "*"})
-            if table_schema is not None:
-                node.annotations.update({"model": table_schema.model, "relation": table_schema.relation})
+            self._attach_table(node, self._resolve_table(node.table))
+            node.annotations["django_path"] = "*"
             return node
 
         select_aliases = self.scope.get("select_aliases", {})
@@ -206,7 +197,7 @@ class AnnotationVisitor(Visitor):
                 {
                     "is_lateral_ref": True,
                     "is_srf_ref": is_srf,
-                    "in_aggregate": bool(self.scope.get("in_aggregate")),
+                    "in_aggregate": self._in_aggregate(),
                     "lateral_alias": node.name,
                     "django_path": node.name,
                 }
@@ -229,7 +220,7 @@ class AnnotationVisitor(Visitor):
                     {
                         "is_lateral_ref": True,
                         "is_srf_ref": True,
-                        "in_aggregate": bool(self.scope.get("in_aggregate")),
+                        "in_aggregate": self._in_aggregate(),
                         "lateral_alias": sql_table_candidate,
                         "django_path": sql_table_candidate,
                     }
@@ -237,19 +228,17 @@ class AnnotationVisitor(Visitor):
             return node
 
         # Plain column reference.
-        sql_table = self._resolve_table(node.table)
-        table_schema = self.schema.get_table(sql_table)
-        node.annotations.update({"sql_table": sql_table, "table_schema": table_schema})
+        table_schema = self._attach_table(node, self._resolve_table(node.table))
         if table_schema is None:
             return node
-        relation = table_schema.relation
         # Inside a lateral subquery, the inner table carries no relation prefix.
-        if self.scope.get("is_lateral_subquery") and sql_table == self.scope.get("inner_table_name"):
-            relation = ""
+        if self.scope.get("is_lateral_subquery") and node.annotations["sql_table"] == self.scope.get(
+            "inner_table_name"
+        ):
+            node.annotations["relation"] = ""
+        relation = node.annotations["relation"]
         node.annotations.update(
             {
-                "model": table_schema.model,
-                "relation": relation,
                 "django_path": f"{relation}__{node.name}" if relation else node.name,
                 "is_json_field": node.name in table_schema.json_fields,
                 "field_allowed": self._field_allowed(table_schema, node.name),
@@ -257,7 +246,7 @@ class AnnotationVisitor(Visitor):
         )
         return node
 
-    def visit_JsonPath(self, node: JsonPath):
+    def visit_JsonPath(self, node: nodes.JsonPath):
         self.visit(node.base)
         base_annotations = node.base.annotations if node.base else {}
         if base_annotations.get("is_lateral_ref"):
@@ -266,7 +255,7 @@ class AnnotationVisitor(Visitor):
                 {
                     "is_lateral_path": True,
                     "is_srf_ref": True,
-                    "in_aggregate": bool(self.scope.get("in_aggregate")),
+                    "in_aggregate": self._in_aggregate(),
                     "lateral_alias": base_annotations["lateral_alias"],
                 }
             )
@@ -296,12 +285,12 @@ class AnnotationVisitor(Visitor):
         )
         return node
 
-    def visit_CastExpr(self, node: CastExpr):
+    def visit_CastExpr(self, node: nodes.CastExpr):
         self.visit(node.expression)
         node.annotations["cast_type"] = normalize_cast_type(node.target_type)
         return node
 
-    def visit_Aggregate(self, node: Aggregate):
+    def visit_Aggregate(self, node: nodes.Aggregate):
         # A scope flag visible to every descendant: it lets a lateral SRF element
         # record whether it is consumed inside an aggregate, without a re-walk.
         with self.scope.scoped(node, in_aggregate=True):
@@ -314,18 +303,18 @@ class AnnotationVisitor(Visitor):
         node.annotations["wraps_srf"] = self._is_srf_ref(self._unwrap_cast(node.expression))
         return node
 
-    def visit_ArithmeticOp(self, node: ArithmeticOp):
+    def visit_ArithmeticOp(self, node: nodes.ArithmeticOp):
         self.visit(node.left)
         self.visit(node.right)
         return node
 
-    def visit_FunctionCall(self, node: FunctionCall):
+    def visit_FunctionCall(self, node: nodes.FunctionCall):
         for arg in node.args:
             self.visit(arg)
         node.annotations["function_name"] = node.name.lower()
         return node
 
-    def visit_CaseExpr(self, node: CaseExpr):
+    def visit_CaseExpr(self, node: nodes.CaseExpr):
         for condition, result in node.whens:
             self.visit(condition)
             self.visit(result)
@@ -338,69 +327,62 @@ class AnnotationVisitor(Visitor):
         return self.scope.get("alias_to_table", {}).get(table, table)
 
     def _unwrap_cast(self, expr):
-        return expr.expression if isinstance(expr, CastExpr) else expr
+        return expr.expression if isinstance(expr, nodes.CastExpr) else expr
+
+    def _in_aggregate(self):
+        return bool(self.scope.get("in_aggregate"))
 
     # -- GROUP BY coverage facts -------------------------------------------
     #
-    # Two structural facts per expression, resolving SELECT-alias references:
-    #   expr_key      — a canonical identity (equal expressions share it)
-    #   column_leaves — the column keys it references outside any aggregate
-    # The validation layer compares these against the GROUP BY to decide
-    # coverage; it does not re-derive them.
+    # The validation layer needs, per SELECT/HAVING/ORDER expression:
+    #   column_leaves — the django paths of the columns it references outside an
+    #                   aggregate (recorded bottom-up in _record_column_leaves)
+    #   is_grouped    — True when this very expression is one of the GROUP BY
+    #                   expressions (marked in _mark_grouped)
+    # It then decides coverage against grouped_columns; it never re-derives these.
 
-    def _annotate_aggregation_facts(self, node: Query):
-        aliases = self.scope.get("select_aliases", {})
-        exprs = []
-        if node.select:
-            for item in node.select.columns:
-                exprs.append(item.expression if isinstance(item, Alias) else item)
-        exprs.extend(node.group_by)
-        if node.having is not None:
-            exprs.append(node.having)
-        exprs.extend(order.expression for order in node.order_by)
-        for expr in exprs:
-            self._expr_facts(expr, aliases)
+    def _resolve_alias(self, node):
+        """Follow a chain of SELECT-alias references to the underlying expression."""
+        select_aliases = self.scope.get("select_aliases", {})
+        seen = set()
+        while (
+            isinstance(node, nodes.Column)
+            and node.annotations.get("select_alias") in select_aliases
+            and id(node) not in seen
+        ):
+            seen.add(id(node))
+            node = select_aliases[node.annotations["select_alias"]]
+        return node
 
-    def _column_key(self, col: Column):
-        django_path = col.annotations.get("django_path")
-        if django_path:
-            return ("col", django_path)
-        return ("col", col.table, col.name)
+    def _record_column_leaves(self, node):
+        if isinstance(node, nodes.Aggregate):
+            node.annotations["column_leaves"] = set()  # inner columns need no grouping
+        elif isinstance(node, nodes.Column):
+            target = self._resolve_alias(node)
+            if target is node:
+                node.annotations["column_leaves"] = {_column_path(node)}
+            else:
+                # A reference to a SELECT alias inherits the target's facts.
+                node.annotations["column_leaves"] = set(target.annotations.get("column_leaves", set()))
+                if target.annotations.get("is_grouped"):
+                    node.annotations["is_grouped"] = True
+        else:
+            leaves = set()
+            for child in node.children():
+                leaves |= child.annotations.get("column_leaves", set())
+            node.annotations["column_leaves"] = leaves
 
-    def _expr_facts(self, node, aliases, _seen=None):
-        if node is None:
-            return None, frozenset()
-        if "expr_key" in node.annotations:
-            return node.annotations["expr_key"], node.annotations["column_leaves"]
-        key, leaves = self._compute_expr_facts(node, aliases, _seen or set())
-        node.annotations["expr_key"] = key
-        node.annotations["column_leaves"] = leaves
-        return key, leaves
-
-    def _compute_expr_facts(self, node, aliases, _seen):
-        if isinstance(node, Alias):
-            return self._expr_facts(node.expression, aliases, _seen)
-        if isinstance(node, Column) and node.annotations.get("select_alias"):
-            target = aliases.get(node.annotations["select_alias"])
-            if target is not None and id(target) not in _seen:
-                return self._expr_facts(target, aliases, _seen | {id(target)})
-        if isinstance(node, Column):
-            column_key = self._column_key(node)
-            return column_key, frozenset({column_key})
-        if isinstance(node, Aggregate):
-            inner_key, _ = self._expr_facts(node.expression, aliases, _seen)
-            # Column leaves inside an aggregate never need to be grouped.
-            return ("agg", node.function.lower(), bool(node.distinct), inner_key), frozenset()
-        parts = [type(node).__name__]
-        for attr in ("op", "name", "target_type", "value", "returns_text"):
-            if hasattr(node, attr):
-                parts.append((attr, getattr(node, attr)))
-        if isinstance(node, JsonPath):
-            parts.append(("path", tuple(node.path)))
-        child_facts = [self._expr_facts(child, aliases, _seen) for child in node.children()]
-        key = (*parts, tuple(child_key for child_key, _ in child_facts))
-        leaves = frozenset().union(*(child_leaves for _, child_leaves in child_facts)) if child_facts else frozenset()
-        return key, leaves
+    def _mark_grouped(self, node: nodes.Query):
+        """Mark every GROUP BY expression as grouped and return the paths of those
+        that are plain columns. A grouped plain column is covered wherever it
+        appears; grouping by a larger expression only covers that same expression."""
+        grouped_columns = set()
+        for expression in node.group_by:
+            target = self._resolve_alias(expression)
+            target.annotations["is_grouped"] = True
+            if isinstance(target, nodes.Column):
+                grouped_columns.add(_column_path(target))
+        return grouped_columns
 
     def _is_srf_ref(self, expr) -> bool:
         """Whether ``expr`` resolves to a LATERAL set-returning-function element.
@@ -422,3 +404,7 @@ class AnnotationVisitor(Visitor):
         db_column_names = {getattr(f, "column", None) for f in table_schema.model._meta.fields}
         json_field_names = set(table_schema.json_fields.keys())
         return field_name in model_field_names or field_name in db_column_names or field_name in json_field_names
+
+
+def _column_path(column):
+    return column.annotations.get("django_path") or f"{column.table}.{column.name}"
