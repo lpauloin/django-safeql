@@ -1460,6 +1460,57 @@ class SQLCodegenLateralJoinTestCase(SQLCodegenBaseTestCase):
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(float(rows[0]["grand_total"] or 0), 120.50, places=2)
 
+    def test_jsonb_array_elements_element_key_is_bound_parameter(self):
+        # The JSON key ('amount') must be sent to the database as a bound parameter,
+        # never interpolated into the SQL text.
+        qs = self.transpiler.to_queryset("""
+            SELECT book.id, SUM((item->>'amount')::numeric) AS total_amount
+            FROM book
+            LEFT JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item ON true
+            GROUP BY book.id
+        """)
+        sql, params = qs.query.sql_with_params()
+        self.assertIn("elem->>%s", sql)
+        self.assertNotIn("->>'amount'", sql)
+        self.assertIn("amount", params)
+
+    def test_jsonb_array_elements_key_with_apostrophe(self):
+        # A JSON key containing a single quote must round-trip correctly instead of
+        # breaking the generated SQL — regression test for the raw-interpolation bug.
+        book = Book.objects.create(
+            author=self.author_x,
+            status="PUBLISHED",
+            title="apostrophe.txt",
+            metadata={"lines": [{"o'clock": "42.00"}]},
+        )
+        qs = self.transpiler.to_queryset(f"""
+            SELECT book.id, SUM((item->>'o''clock')::numeric) AS total_amount
+            FROM book
+            LEFT JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item ON true
+            WHERE book.id = {book.id}
+            GROUP BY book.id
+        """)
+        rows = {r["id"]: r["total_amount"] for r in list(qs)}
+        self.assertAlmostEqual(float(rows[book.id]), 42.00, places=2)
+
+    def test_jsonb_array_elements_element_key_injection_is_neutralized(self):
+        # Regression test for the SQL injection via the LATERAL jsonb_array_elements
+        # element key (see audit): a malicious key must never break out of the
+        # generated SQL, and must never appear in the SQL text — only in params.
+        qs = self.transpiler.to_queryset("""
+            SELECT book.id, SUM((item->>'x'') UNION SELECT password FROM auth_user --')::numeric) AS total
+            FROM book
+            LEFT JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item ON true
+            GROUP BY book.id
+        """)
+        sql, params = qs.query.sql_with_params()
+        self.assertNotIn("UNION", sql.upper())
+        self.assertNotIn("auth_user", sql)
+        self.assertIn("x') UNION SELECT password FROM auth_user --", params)
+        # Executing must not raise a SQL syntax error — the payload is bound as an
+        # inert literal key that simply matches nothing.
+        list(qs)
+
     def test_lateral_inner_where_in_values(self):
         qs = self.transpiler.to_queryset("""
             SELECT book.id, pinfo.name AS author_name

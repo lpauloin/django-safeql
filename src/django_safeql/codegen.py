@@ -133,15 +133,19 @@ class JsonbArrayAggFunc(Func):
     def as_sql(self, compiler, connection, **extra_context):
         source_sql, params = compiler.compile(self.source_expressions[0])
         cast = f"::{self._cast_type}" if self._cast_type else ""
+        extra_params: list = []
         if self._fn_name == "jsonb_array_elements_text":
             val = f"elem{cast}"
         elif self._element_key:
-            val = f"(elem->>'{self._element_key}'){cast}"
+            # element_key comes from the query text (JSON path segment) and must never be
+            # interpolated into the SQL string — bind it as a parameter instead.
+            val = f"(elem->>%s){cast}"
+            extra_params = [self._element_key]
         else:
             val = f"elem{cast}"
         return (
             f"(SELECT {self._agg_fn}({val}) FROM {self._fn_name}({source_sql}) AS elem)",
-            params,
+            extra_params + list(params),
         )
 
 
