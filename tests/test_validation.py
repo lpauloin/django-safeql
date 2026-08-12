@@ -109,6 +109,64 @@ class SQLLateralValidationTestCase(TestCase):
                 ) AS pinfo ON true
             """)
 
+    def test_lateral_rejects_join_in_subquery(self):
+        # Regression test: a JOIN inside a LATERAL subquery used to be silently
+        # dropped by codegen (never applied) instead of being rejected.
+        with self.assertRaisesRegex(ValidationError, "JOIN is not supported"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                LEFT JOIN LATERAL (
+                    SELECT p.name FROM author p
+                    JOIN publisher q ON p.publisher_id = q.id AND q.is_active = true
+                    WHERE p.id = book.author_id
+                    LIMIT 1
+                ) AS pinfo ON true
+            """)
+
+    def test_lateral_rejects_group_by_in_subquery(self):
+        # Regression test: GROUP BY inside a LATERAL subquery used to be silently
+        # dropped by codegen instead of being rejected.
+        with self.assertRaisesRegex(ValidationError, "GROUP BY is not supported"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                LEFT JOIN LATERAL (
+                    SELECT p.name FROM author p WHERE p.publisher_id = book.publisher_id
+                    GROUP BY p.name
+                    LIMIT 1
+                ) AS pinfo ON true
+            """)
+
+    def test_lateral_rejects_distinct_in_subquery(self):
+        with self.assertRaisesRegex(ValidationError, "DISTINCT is not supported"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                LEFT JOIN LATERAL (
+                    SELECT DISTINCT p.name FROM author p WHERE p.id = book.author_id LIMIT 1
+                ) AS pinfo ON true
+            """)
+
+    def test_lateral_rejects_misleading_limit_in_subquery(self):
+        # Regression test: a LIMIT other than 1 used to be silently coerced to 1 by
+        # codegen instead of being rejected — the written LIMIT was pure fiction.
+        with self.assertRaisesRegex(ValidationError, "LIMIT must be omitted or set to 1"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                LEFT JOIN LATERAL (
+                    SELECT p.name FROM author p WHERE p.id = book.author_id LIMIT 5
+                ) AS pinfo ON true
+            """)
+
+    def test_exists_rejects_join_in_subquery(self):
+        with self.assertRaisesRegex(ValidationError, "JOIN is not supported"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                WHERE EXISTS (
+                    SELECT 1 FROM author p
+                    JOIN publisher q ON p.publisher_id = q.id
+                    WHERE p.id = book.author_id
+                )
+            """)
+
     def test_lateral_rejects_unwhitelisted_outer_field_in_where(self):
         # Regression test: an outer-table column referenced from inside a LATERAL
         # subquery's WHERE clause must be checked against the outer table's

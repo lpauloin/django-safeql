@@ -220,6 +220,22 @@ class ValidationVisitor(Visitor):
         return node
 
     def _validate_subquery_body(self, subquery: Query):
+        # These clauses are accepted by the parser but never applied by codegen
+        # (_build_inner_queryset only ever honours WHERE and ORDER BY) — rejecting
+        # them here turns a silently-wrong query into a clear error instead.
+        if subquery.joins:
+            raise ValidationError("JOIN is not supported inside LATERAL/EXISTS subqueries")
+        if subquery.group_by:
+            raise ValidationError("GROUP BY is not supported inside LATERAL/EXISTS subqueries")
+        if subquery.having:
+            raise ValidationError("HAVING is not supported inside LATERAL/EXISTS subqueries")
+        if subquery.distinct:
+            raise ValidationError("DISTINCT is not supported inside LATERAL/EXISTS subqueries")
+        if subquery.limit is not None and subquery.limit != 1:
+            raise ValidationError(
+                "LATERAL/EXISTS subqueries always return at most one correlated row per outer row; "
+                "LIMIT must be omitted or set to 1"
+            )
         if subquery.where:
             self.visit(subquery.where)
         if subquery.select:
