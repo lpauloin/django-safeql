@@ -160,77 +160,82 @@ class AnnotationVisitor(Visitor):
         if node.name == "*":
             self._attach_table(node, self._resolve_table(node.table))
             node.annotations["django_path"] = "*"
-            return node
+        elif not (
+            self._annotate_select_alias(node) or self._annotate_outer_ref(node) or self._annotate_lateral_ref(node)
+        ):
+            self._annotate_plain_column(node)
+        return node
 
+    def _annotate_select_alias(self, node) -> bool:
+        """An unqualified name that matches a SELECT alias refers to that alias."""
         select_aliases = self.scope.get("select_aliases", {})
         if node.table is None and node.name in select_aliases:
             node.annotations.update({"select_alias": node.name, "django_path": node.name})
-            return node
+            return True
+        return False
 
-        # Outer reference — inside a lateral subquery, a column qualified with an
-        # outer table is a correlation (OuterRef), not an inner-table column.
-        if self.scope.get("is_lateral_subquery") and node.table:
-            outer_alias_to_table = self.scope.get("outer_alias_to_table", {})
-            if node.table in outer_alias_to_table:
-                outer_table_name = outer_alias_to_table[node.table]
-                outer_table_schema = self.schema.get_table(outer_table_name)
-                if outer_table_schema is not None:
-                    outer_rel = outer_table_schema.relation
-                    outer_django_path = f"{outer_rel}__{node.name}" if outer_rel else node.name
-                    node.annotations.update(
-                        {
-                            "is_outer_ref": True,
-                            "outer_table_name": outer_table_name,
-                            "outer_field_name": node.name,
-                            "outer_django_path": outer_django_path,
-                            "field_allowed": self._field_allowed(outer_table_schema, node.name),
-                        }
-                    )
-                    return node
+    def _annotate_outer_ref(self, node) -> bool:
+        """Inside a lateral subquery, a column qualified with an outer table is a
+        correlation (OuterRef), not an inner-table column."""
+        if not (self.scope.get("is_lateral_subquery") and node.table):
+            return False
+        outer_table_name = self.scope.get("outer_alias_to_table", {}).get(node.table)
+        outer_table_schema = self.schema.get_table(outer_table_name) if outer_table_name else None
+        if outer_table_schema is None:
+            return False
+        relation = outer_table_schema.relation
+        node.annotations.update(
+            {
+                "is_outer_ref": True,
+                "outer_table_name": outer_table_name,
+                "outer_field_name": node.name,
+                "outer_django_path": f"{relation}__{node.name}" if relation else node.name,
+                "field_allowed": self._field_allowed(outer_table_schema, node.name),
+            }
+        )
+        return True
 
-        # Lateral alias references — column names that refer to a LATERAL JOIN alias.
+    def _annotate_lateral_ref(self, node) -> bool:
+        """A column whose name (or table qualifier) is a LATERAL JOIN alias."""
         lateral_aliases = self.scope.get("lateral_aliases", {})
-        sql_table_candidate = self._resolve_table(node.table) if node.table else node.name
         if node.table is None and node.name in lateral_aliases:
-            is_srf = lateral_aliases[node.name].fn_call is not None
-            node.annotations.update(
-                {
-                    "is_lateral_ref": True,
-                    "is_srf_ref": is_srf,
-                    "in_aggregate": self._in_aggregate(),
-                    "lateral_alias": node.name,
-                    "django_path": node.name,
-                }
-            )
-            return node
-        if node.table is not None and sql_table_candidate in lateral_aliases:
-            lateral_join_node = lateral_aliases[sql_table_candidate]
-            if lateral_join_node.subquery is not None:
-                ann_key = f"{sql_table_candidate}_{node.name}"
+            if lateral_aliases[node.name].fn_call is not None:
+                self._mark_srf_ref(node, node.name)
+            else:
+                node.annotations.update({"is_lateral_ref": True, "lateral_alias": node.name, "django_path": node.name})
+            return True
+        alias = self._resolve_table(node.table) if node.table else node.name
+        if node.table is not None and alias in lateral_aliases:
+            if lateral_aliases[alias].subquery is not None:
                 node.annotations.update(
                     {
                         "is_lateral_ref": True,
-                        "lateral_alias": sql_table_candidate,
+                        "lateral_alias": alias,
                         "lateral_field": node.name,
-                        "django_path": ann_key,
+                        "django_path": f"{alias}_{node.name}",
                     }
                 )
             else:
-                node.annotations.update(
-                    {
-                        "is_lateral_ref": True,
-                        "is_srf_ref": True,
-                        "in_aggregate": self._in_aggregate(),
-                        "lateral_alias": sql_table_candidate,
-                        "django_path": sql_table_candidate,
-                    }
-                )
-            return node
+                self._mark_srf_ref(node, alias)
+            return True
+        return False
 
-        # Plain column reference.
+    def _mark_srf_ref(self, node, alias):
+        """A reference to an element of a LATERAL set-returning function."""
+        node.annotations.update(
+            {
+                "is_lateral_ref": True,
+                "is_srf_ref": True,
+                "in_aggregate": self._in_aggregate(),
+                "lateral_alias": alias,
+                "django_path": alias,
+            }
+        )
+
+    def _annotate_plain_column(self, node):
         table_schema = self._attach_table(node, self._resolve_table(node.table))
         if table_schema is None:
-            return node
+            return
         # Inside a lateral subquery, the inner table carries no relation prefix.
         if self.scope.get("is_lateral_subquery") and node.annotations["sql_table"] == self.scope.get(
             "inner_table_name"
@@ -244,7 +249,6 @@ class AnnotationVisitor(Visitor):
                 "field_allowed": self._field_allowed(table_schema, node.name),
             }
         )
-        return node
 
     def visit_JsonPath(self, node: nodes.JsonPath):
         self.visit(node.base)
