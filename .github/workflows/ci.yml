@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django_safeql
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        django-version: ["4.2.*", "5.2.*"]
+    env:
+      DJANGO_SAFEQL_TEST_DB: django_safeql
+      DJANGO_SAFEQL_TEST_DB_USER: postgres
+      DJANGO_SAFEQL_TEST_DB_PASSWORD: postgres
+      DJANGO_SAFEQL_TEST_DB_HOST: localhost
+      DJANGO_SAFEQL_TEST_DB_PORT: 5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install ".[dev]" "django==${{ matrix.django-version }}"
+      - run: PYTHONPATH=src:. pytest tests/ -v
+      - run: black --check src/ tests/
+      - run: flake8 src/ tests/
