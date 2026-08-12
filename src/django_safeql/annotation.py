@@ -193,7 +193,8 @@ class AnnotationVisitor(Visitor):
             node.annotations.update(
                 {
                     "is_lateral_ref": True,
-                    "is_lateral_srf_ref": is_srf,
+                    "is_srf_ref": is_srf,
+                    "in_aggregate": bool(self.scope.get("in_aggregate")),
                     "lateral_alias": node.name,
                     "django_path": node.name,
                 }
@@ -215,7 +216,8 @@ class AnnotationVisitor(Visitor):
                 node.annotations.update(
                     {
                         "is_lateral_ref": True,
-                        "is_lateral_srf_ref": True,
+                        "is_srf_ref": True,
+                        "in_aggregate": bool(self.scope.get("in_aggregate")),
                         "lateral_alias": sql_table_candidate,
                         "django_path": sql_table_candidate,
                     }
@@ -248,7 +250,14 @@ class AnnotationVisitor(Visitor):
         base_annotations = node.base.annotations if node.base else {}
         if base_annotations.get("is_lateral_ref"):
             # JSON path on a lateral SRF element (e.g., item->>'amount').
-            node.annotations.update({"is_lateral_path": True, "lateral_alias": base_annotations["lateral_alias"]})
+            node.annotations.update(
+                {
+                    "is_lateral_path": True,
+                    "is_srf_ref": True,
+                    "in_aggregate": bool(self.scope.get("in_aggregate")),
+                    "lateral_alias": base_annotations["lateral_alias"],
+                }
+            )
             return node
         if base_annotations.get("is_outer_ref"):
             node.annotations["json_base_is_outer_ref"] = True
@@ -281,12 +290,16 @@ class AnnotationVisitor(Visitor):
         return node
 
     def visit_Aggregate(self, node: Aggregate):
-        self.visit(node.expression)
-        for arg in node.extra_args:
-            self.visit(arg)
-        for o in node.order_by:
-            self.visit(o)
+        # A scope flag visible to every descendant: it lets a lateral SRF element
+        # record whether it is consumed inside an aggregate, without a re-walk.
+        with self.scope.scoped(node, in_aggregate=True):
+            self.visit(node.expression)
+            for arg in node.extra_args:
+                self.visit(arg)
+            for o in node.order_by:
+                self.visit(o)
         node.annotations["aggregate_function"] = node.function.lower()
+        node.annotations["wraps_srf"] = self._is_srf_ref(self._unwrap_cast(node.expression))
         return node
 
     def visit_ArithmeticOp(self, node: ArithmeticOp):
@@ -311,6 +324,17 @@ class AnnotationVisitor(Visitor):
         if not table:
             return self.schema.base_table
         return self.scope.get("alias_to_table", {}).get(table, table)
+
+    def _unwrap_cast(self, expr):
+        return expr.expression if isinstance(expr, CastExpr) else expr
+
+    def _is_srf_ref(self, expr) -> bool:
+        """Whether ``expr`` resolves to a LATERAL set-returning-function element.
+
+        Single source of truth for SRF detection, consumed by both the validation
+        and codegen layers via the ``is_srf_ref`` annotation.
+        """
+        return bool(expr is not None and expr.annotations.get("is_srf_ref"))
 
     def _field_allowed(self, table_schema, field_name: str) -> bool:
         """Whether ``field_name`` is reachable on ``table_schema`` per its whitelist.

@@ -100,7 +100,6 @@ class ValidationVisitor(Visitor):
         # Validate every sub-node first (surfaces field/table/operator errors and
         # resolves column annotations), then enforce the cross-clause rules on top.
         self.generic_visit(node)
-        self._check_lateral_srf_usage(node)
         self._check_aggregation(node)
         return node
 
@@ -124,6 +123,7 @@ class ValidationVisitor(Visitor):
         return node
 
     def visit_Column(self, node: Column):
+        self._reject_srf_outside_aggregate(node)
         if node.annotations.get("is_outer_ref"):
             if not node.annotations["field_allowed"]:
                 raise ValidationError(
@@ -148,56 +148,16 @@ class ValidationVisitor(Visitor):
     #
     # Elements produced by a LATERAL set-returning function (jsonb_array_elements
     # and friends) may only be consumed inside a scalar aggregate — the codegen
-    # compiles them to a correlated aggregate subquery and has no meaning for a
-    # bare per-element reference or a collection aggregate over them.
+    # compiles them to a correlated aggregate subquery. Annotation records both
+    # facts (is_srf_ref/in_aggregate on the element, wraps_srf on the aggregate),
+    # so these decisions ride the normal traversal instead of a second walk.
 
-    def _check_lateral_srf_usage(self, node: Query):
-        exprs = []
-        for item in node.select.columns if node.select else []:
-            exprs.append(item.expression if isinstance(item, Alias) else item)
-        exprs.extend(filter(None, [node.where, node.having]))
-        exprs.extend(node.group_by)
-        exprs.extend(order.expression for order in node.order_by)
-        for expr in exprs:
-            self._scan_srf(expr, inside_aggregate=False)
-
-    def _scan_srf(self, expr, inside_aggregate: bool):
-        if expr is None:
-            return
-        if isinstance(expr, Aggregate):
-            if (
-                not inside_aggregate
-                and expr.function.lower() in COLLECTION_AGGREGATES
-                and self._is_srf_expr(expr.expression)
-            ):
-                raise ValidationError(
-                    f"{expr.function.upper()} is not supported over LATERAL set-returning functions; "
-                    "use SUM, COUNT, AVG, MIN or MAX instead"
-                )
-            for child in expr.children():
-                self._scan_srf(child, inside_aggregate=True)
-            return
-        if self._is_srf_ref(expr):
-            if not inside_aggregate:
-                raise ValidationError(
-                    "LATERAL set-returning function elements may only be used inside an "
-                    "aggregate function (SUM, COUNT, AVG, MIN, MAX)"
-                )
-            return
-        for child in expr.children():
-            self._scan_srf(child, inside_aggregate)
-
-    def _is_srf_ref(self, expr) -> bool:
-        if isinstance(expr, Column):
-            return bool(expr.annotations.get("is_lateral_srf_ref"))
-        if isinstance(expr, JsonPath):
-            return bool(expr.annotations.get("is_lateral_path"))
-        return False
-
-    def _is_srf_expr(self, expr) -> bool:
-        if isinstance(expr, CastExpr):
-            expr = expr.expression
-        return self._is_srf_ref(expr)
+    def _reject_srf_outside_aggregate(self, node):
+        if node.annotations.get("is_srf_ref") and not node.annotations.get("in_aggregate"):
+            raise ValidationError(
+                "LATERAL set-returning function elements may only be used inside an "
+                "aggregate function (SUM, COUNT, AVG, MIN, MAX)"
+            )
 
     # -- GROUP BY / aggregation coverage -----------------------------------
     #
@@ -315,6 +275,7 @@ class ValidationVisitor(Visitor):
 
     def visit_JsonPath(self, node: JsonPath):
         self.visit(node.base)
+        self._reject_srf_outside_aggregate(node)
         if node.annotations.get("is_lateral_path"):
             return node  # Lateral element paths are not validated against the schema
         if node.annotations.get("json_base_is_outer_ref"):
@@ -367,6 +328,11 @@ class ValidationVisitor(Visitor):
     def visit_Aggregate(self, node: Aggregate):
         if node.function.lower() not in SUPPORTED_AGGREGATES:
             raise ValidationError(f"Unsupported aggregate: {node.function}")
+        if node.annotations.get("wraps_srf") and node.function.lower() in COLLECTION_AGGREGATES:
+            raise ValidationError(
+                f"{node.function.upper()} is not supported over LATERAL set-returning functions; "
+                "use SUM, COUNT, AVG, MIN or MAX instead"
+            )
         self.visit(node.expression)
         for arg in node.extra_args:
             self.visit(arg)

@@ -449,14 +449,8 @@ class CodegenVisitor(Visitor):
         return None
 
     def _is_lateral_srf_expr(self, expr) -> bool:
-        inner = expr
-        if isinstance(inner, CastExpr):
-            inner = inner.expression
-        if isinstance(inner, JsonPath):
-            return inner.annotations.get("is_lateral_path", False)
-        if isinstance(inner, Column):
-            return inner.annotations.get("is_lateral_ref", False) and inner.name in self.lateral_fn_sources
-        return False
+        inner = expr.expression if isinstance(expr, CastExpr) else expr
+        return bool(inner is not None and inner.annotations.get("is_srf_ref"))
 
     def _agg_output_field(self, function: str, cast_type: str | None = None):
         if function == "count":
