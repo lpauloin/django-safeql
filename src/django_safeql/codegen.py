@@ -488,7 +488,7 @@ class CodegenVisitor(Visitor):
             qs = qs.filter(where_q)
 
         if node.group_by:
-            group_fields = self._selected_group_value_fields(node)
+            group_fields = self._group_by_value_fields(node)
             group_field_set = set(group_fields)
             # Annotate non-aggregate select expressions that appear in GROUP BY before .values(),
             # so Django can reference them by name in the GROUP BY clause.
@@ -574,18 +574,14 @@ class CodegenVisitor(Visitor):
             self.annotate_kwargs = {}
         return qs
 
-    def _selected_group_value_fields(self, node: Query) -> list[str]:
-        selected_paths: set[str] = set()
-        if node.select:
-            for selected in node.select.columns:
-                if isinstance(selected, Column) and selected.name != "*":
-                    selected_paths.add(self.visit_Column(selected))
-                elif isinstance(selected, Alias):
-                    if isinstance(selected.expression, Column) and selected.expression.name != "*":
-                        selected_paths.add(self.visit_Column(selected.expression))
-                    selected_paths.add(selected.alias)
+    def _group_by_value_fields(self, node: Query) -> list[str]:
+        # Every GROUP BY expression becomes a .values() field, whether or not it's
+        # also selected — SQL doesn't require them to match, and dropping a GROUP BY
+        # column just because it isn't selected would silently turn an aggregate
+        # query into a per-row one (e.g. "SELECT COUNT(*) ... GROUP BY status" would
+        # otherwise group by every column instead of by status).
         group_paths = [self.visit(expr_) for expr_ in node.group_by]
-        return [path for path in group_paths if path in selected_paths]
+        return list(dict.fromkeys(group_paths))
 
     def _plain_select_value_fields(self, select: Select | None) -> list[str]:
         if not select:

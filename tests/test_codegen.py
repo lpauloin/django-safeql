@@ -447,6 +447,21 @@ class SQLCodegenAggregateTestCase(SQLCodegenBaseTestCase):
         rows = list(qs)
         self.assertEqual({row["author__id"] for row in rows}, {self.author_x.id, self.author_y.id, self.author_z.id})
 
+    def test_group_by_column_not_in_select_still_groups(self):
+        # Regression test: GROUP BY on a column that isn't also in the SELECT list
+        # (very ordinary SQL, e.g. "SELECT COUNT(*) ... GROUP BY status") used to be
+        # silently dropped, turning the query into one group per row instead of one
+        # group per distinct status.
+        qs = self.transpiler.to_queryset("""
+            SELECT COUNT(*) AS cnt
+            FROM book
+            GROUP BY book.status
+        """)
+        self.assertSqlContains(qs, "GROUP BY")
+        counts = {row["status"]: row["cnt"] for row in qs}
+        # d1, d2, d4 are PUBLISHED; d3 is REJECTED.
+        self.assertEqual(counts, {"PUBLISHED": 3, "REJECTED": 1})
+
 
 # ---------------------------------------------------------------------------
 # 7. Collection aggregates — ARRAY_AGG, STRING_AGG, JSON_AGG, etc.
@@ -760,6 +775,10 @@ class SQLCodegenNestedTestCase(SQLCodegenBaseTestCase):
             [
                 {
                     "author__id": self.author_x.id,
+                    # GROUP BY author.id, author.name — author.name is a real GROUP BY
+                    # key (not just the LOWER() projection of it), so it must appear in
+                    # the grouped output alongside author_name, matching the SQL text.
+                    "author__name": "Ada Lovelace",
                     "author_name": "ada lovelace",
                     "total": 2,
                     "weighted_credits": (2 + 1) * 2 + (4 + 1) * 2,
