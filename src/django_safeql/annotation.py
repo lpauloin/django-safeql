@@ -255,6 +255,15 @@ class AnnotationVisitor(Visitor):
                 }
             )
             return node
+        if node.base.annotations.get("is_outer_ref"):
+            # Outer-ref columns only carry outer_django_path/table info for a plain
+            # equality correlation — they have no django_path/table_schema to resolve
+            # a JSON path against, so fail clearly instead of KeyError-ing below.
+            node.annotations["error"] = (
+                "JSON path access on a reference to the outer query's table is not "
+                "supported inside LATERAL/EXISTS subqueries"
+            )
+            return node
         base_path = node.base.annotations["django_path"]
         table_schema: TableSchema = node.base.annotations["table_schema"]
         json_field_schema = table_schema.json_fields.get(node.base.name)

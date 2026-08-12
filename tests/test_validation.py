@@ -167,6 +167,26 @@ class SQLLateralValidationTestCase(TestCase):
                 )
             """)
 
+    def test_lateral_rejects_json_path_on_outer_ref(self):
+        # Regression test: a JSON path applied to an outer-table correlation used to
+        # crash with an unhandled KeyError instead of a clean ValidationError.
+        with self.assertRaisesRegex(ValidationError, "JSON path access on a reference to the outer"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                LEFT JOIN LATERAL (
+                    SELECT p.name FROM author p WHERE p.name = book.metadata->>'source' LIMIT 1
+                ) AS pinfo ON true
+            """)
+
+    def test_exists_rejects_json_path_on_outer_ref(self):
+        with self.assertRaisesRegex(ValidationError, "JSON path access on a reference to the outer"):
+            self.transpiler.to_ast("""
+                SELECT book.id FROM book
+                WHERE EXISTS (
+                    SELECT 1 FROM author p WHERE p.name = book.metadata->>'source'
+                )
+            """)
+
     def test_lateral_rejects_unwhitelisted_outer_field_in_where(self):
         # Regression test: an outer-table column referenced from inside a LATERAL
         # subquery's WHERE clause must be checked against the outer table's
