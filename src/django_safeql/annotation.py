@@ -59,6 +59,7 @@ class AnnotationVisitor(Visitor):
             node.annotations["base_model"] = self.schema.base_model
             node.annotations["select_aliases"] = dict(self.scope.get("select_aliases", {}))
             node.annotations["node_types"] = set(self.scope.types())
+            self._annotate_aggregation_facts(node)
         return node
 
     def visit_From(self, node: From):
@@ -338,6 +339,68 @@ class AnnotationVisitor(Visitor):
 
     def _unwrap_cast(self, expr):
         return expr.expression if isinstance(expr, CastExpr) else expr
+
+    # -- GROUP BY coverage facts -------------------------------------------
+    #
+    # Two structural facts per expression, resolving SELECT-alias references:
+    #   expr_key      — a canonical identity (equal expressions share it)
+    #   column_leaves — the column keys it references outside any aggregate
+    # The validation layer compares these against the GROUP BY to decide
+    # coverage; it does not re-derive them.
+
+    def _annotate_aggregation_facts(self, node: Query):
+        aliases = self.scope.get("select_aliases", {})
+        exprs = []
+        if node.select:
+            for item in node.select.columns:
+                exprs.append(item.expression if isinstance(item, Alias) else item)
+        exprs.extend(node.group_by)
+        if node.having is not None:
+            exprs.append(node.having)
+        exprs.extend(order.expression for order in node.order_by)
+        for expr in exprs:
+            self._expr_facts(expr, aliases)
+
+    def _column_key(self, col: Column):
+        django_path = col.annotations.get("django_path")
+        if django_path:
+            return ("col", django_path)
+        return ("col", col.table, col.name)
+
+    def _expr_facts(self, node, aliases, _seen=None):
+        if node is None:
+            return None, frozenset()
+        if "expr_key" in node.annotations:
+            return node.annotations["expr_key"], node.annotations["column_leaves"]
+        key, leaves = self._compute_expr_facts(node, aliases, _seen or set())
+        node.annotations["expr_key"] = key
+        node.annotations["column_leaves"] = leaves
+        return key, leaves
+
+    def _compute_expr_facts(self, node, aliases, _seen):
+        if isinstance(node, Alias):
+            return self._expr_facts(node.expression, aliases, _seen)
+        if isinstance(node, Column) and node.annotations.get("select_alias"):
+            target = aliases.get(node.annotations["select_alias"])
+            if target is not None and id(target) not in _seen:
+                return self._expr_facts(target, aliases, _seen | {id(target)})
+        if isinstance(node, Column):
+            column_key = self._column_key(node)
+            return column_key, frozenset({column_key})
+        if isinstance(node, Aggregate):
+            inner_key, _ = self._expr_facts(node.expression, aliases, _seen)
+            # Column leaves inside an aggregate never need to be grouped.
+            return ("agg", node.function.lower(), bool(node.distinct), inner_key), frozenset()
+        parts = [type(node).__name__]
+        for attr in ("op", "name", "target_type", "value", "returns_text"):
+            if hasattr(node, attr):
+                parts.append((attr, getattr(node, attr)))
+        if isinstance(node, JsonPath):
+            parts.append(("path", tuple(node.path)))
+        child_facts = [self._expr_facts(child, aliases, _seen) for child in node.children()]
+        key = (*parts, tuple(child_key for child_key, _ in child_facts))
+        leaves = frozenset().union(*(child_leaves for _, child_leaves in child_facts)) if child_facts else frozenset()
+        return key, leaves
 
     def _is_srf_ref(self, expr) -> bool:
         """Whether ``expr`` resolves to a LATERAL set-returning-function element.

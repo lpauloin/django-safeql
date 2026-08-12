@@ -182,96 +182,47 @@ class ValidationVisitor(Visitor):
     def _check_aggregation(self, node: Query):
         if not (node.group_by or _select_has_aggregate(node.select)):
             return
-        aliases = node.annotations.get("select_aliases") or {}
-        grouped_keys, grouped_leaves = self._grouping_sets(node, aliases)
+        grouped_keys, grouped_leaves = self._grouping_sets(node)
 
         for item in node.select.columns if node.select else []:
             expr = item.expression if isinstance(item, Alias) else item
-            if not self._covered(expr, grouped_keys, grouped_leaves, aliases):
-                label = self._ungrouped_label(expr, grouped_leaves, aliases)
+            if not self._covered(expr, grouped_keys, grouped_leaves):
+                label = self._ungrouped_label(expr, grouped_leaves)
                 raise ValidationError(
                     f"Column {label!r} must appear in GROUP BY or be used in an aggregate function"
                     if label
                     else "SELECT expression must appear in GROUP BY or be used in an aggregate function"
                 )
 
-        if node.having is not None and not self._covered(node.having, grouped_keys, grouped_leaves, aliases):
+        if node.having is not None and not self._covered(node.having, grouped_keys, grouped_leaves):
             raise ValidationError("HAVING may only reference aggregates or GROUP BY expressions")
 
         for order in node.order_by:
-            if not self._covered(order.expression, grouped_keys, grouped_leaves, aliases):
+            if not self._covered(order.expression, grouped_keys, grouped_leaves):
                 raise ValidationError(
                     "ORDER BY may only reference aggregates or GROUP BY expressions in an aggregated query"
                 )
 
-    def _grouping_sets(self, node: Query, aliases: dict):
+    def _grouping_sets(self, node: Query):
         grouped_keys: set = set()
         grouped_leaves: set = set()
         for group_expr in node.group_by:
-            grouped_keys.add(self._expr_key(group_expr, aliases))
-            resolved = self._resolve_alias(group_expr, aliases)
-            if isinstance(resolved, Column) and resolved.name != "*":
-                grouped_leaves.add(self._column_key(resolved))
+            key = group_expr.annotations["expr_key"]
+            grouped_keys.add(key)
+            # A group key that is a plain column reference makes that column covered
+            # wherever it appears; grouping by an expression does not (only exact
+            # matches of the expression are covered, via grouped_keys).
+            if key[0] == "col":
+                grouped_leaves.add(key)
         return grouped_keys, grouped_leaves
 
-    def _covered(self, expr, grouped_keys: set, grouped_leaves: set, aliases: dict) -> bool:
-        if self._expr_key(expr, aliases) in grouped_keys:
+    def _covered(self, expr, grouped_keys: set, grouped_leaves: set) -> bool:
+        if expr.annotations["expr_key"] in grouped_keys:
             return True
-        return all(leaf in grouped_leaves for leaf in self._leaves(expr, aliases))
+        return all(leaf in grouped_leaves for leaf in expr.annotations["column_leaves"])
 
-    def _resolve_alias(self, expr, aliases: dict, _seen=None):
-        """Resolve a column that references a SELECT alias to the aliased expression."""
-        if _seen is None:
-            _seen = set()
-        if isinstance(expr, Alias):
-            return self._resolve_alias(expr.expression, aliases, _seen)
-        if isinstance(expr, Column) and expr.annotations.get("select_alias"):
-            name = expr.annotations["select_alias"]
-            target = aliases.get(name)
-            if target is not None and id(target) not in _seen:
-                _seen.add(id(target))
-                return self._resolve_alias(target, aliases, _seen)
-        return expr
-
-    def _column_key(self, col: Column):
-        django_path = col.annotations.get("django_path")
-        if django_path:
-            return ("col", django_path)
-        return ("col", col.table, col.name)
-
-    def _expr_key(self, expr, aliases: dict):
-        expr = self._resolve_alias(expr, aliases)
-        if isinstance(expr, Column):
-            return self._column_key(expr)
-        if isinstance(expr, Aggregate):
-            inner = self._expr_key(expr.expression, aliases) if expr.expression else None
-            return ("agg", expr.function.lower(), bool(expr.distinct), inner)
-        parts = [type(expr).__name__]
-        for attr in ("op", "name", "target_type", "value", "returns_text"):
-            if hasattr(expr, attr):
-                parts.append((attr, getattr(expr, attr)))
-        if isinstance(expr, JsonPath):
-            parts.append(("path", tuple(expr.path)))
-        parts.append(tuple(self._expr_key(child, aliases) for child in expr.children()))
-        return tuple(parts)
-
-    def _leaves(self, expr, aliases: dict):
-        """Yield column keys for columns referenced outside of any aggregate.
-
-        A bare ``*`` column counts as an ungroupable leaf, so ``SELECT *`` is
-        rejected in an aggregated query.
-        """
-        expr = self._resolve_alias(expr, aliases)
-        if isinstance(expr, Aggregate):
-            return
-        if isinstance(expr, Column):
-            yield self._column_key(expr)
-            return
-        for child in expr.children():
-            yield from self._leaves(child, aliases)
-
-    def _ungrouped_label(self, expr, grouped_leaves: set, aliases: dict):
-        for leaf in self._leaves(expr, aliases):
+    def _ungrouped_label(self, expr, grouped_leaves: set):
+        for leaf in expr.annotations["column_leaves"]:
             if leaf not in grouped_leaves:
                 return leaf[1] if len(leaf) == 2 else ".".join(p for p in leaf[1:] if p)
         return None
