@@ -69,6 +69,13 @@ class SQLValidationTestCase(TestCase):
                 LIMIT 5000
             """)
 
+    def test_validation_rejects_unsupported_cast_type(self):
+        with self.assertRaisesRegex(ValidationError, "Unsupported cast type"):
+            self.transpiler.to_ast("""
+                SELECT book.pages::geometry AS g
+                FROM book
+            """)
+
 
 class SQLGroupByCoverageValidationTestCase(TestCase):
     """SQL-standard GROUP BY coverage: every non-aggregate expression in
@@ -155,6 +162,33 @@ class SQLLateralValidationTestCase(TestCase):
             CROSS JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item
             GROUP BY book.id
         """)
+
+    def test_lateral_rejects_collection_aggregate_over_srf(self):
+        with self.assertRaisesRegex(ValidationError, "not supported over LATERAL set-returning"):
+            self.transpiler.to_ast("""
+                SELECT book.id, ARRAY_AGG((item->>'amount')::numeric) AS a
+                FROM book
+                LEFT JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item ON true
+                GROUP BY book.id
+            """)
+
+    def test_lateral_rejects_srf_element_outside_aggregate(self):
+        with self.assertRaisesRegex(ValidationError, "may only be used inside an aggregate"):
+            self.transpiler.to_ast("""
+                SELECT book.id, (item->>'amount') AS a
+                FROM book
+                LEFT JOIN LATERAL jsonb_array_elements(book.metadata->'lines') AS item ON true
+            """)
+
+    def test_lateral_subquery_rejects_non_scalar_aggregate(self):
+        with self.assertRaisesRegex(ValidationError, "is not supported inside LATERAL/EXISTS subqueries"):
+            self.transpiler.to_ast("""
+                SELECT book.id, x.n AS n
+                FROM book
+                LEFT JOIN LATERAL (
+                    SELECT ARRAY_AGG(p.name) AS n FROM author p WHERE p.id = book.author_id
+                ) AS x ON true
+            """)
 
     def test_lateral_rejects_unknown_inner_table(self):
         with self.assertRaisesRegex(ValidationError, "Unknown table"):

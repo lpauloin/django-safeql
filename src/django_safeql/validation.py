@@ -1,18 +1,21 @@
 from django_safeql.constants import (
+    COLLECTION_AGGREGATES,
+    SCALAR_AGGREGATES,
     SUPPORTED_AGGREGATES,
     SUPPORTED_ARITHMETIC_OPS,
     SUPPORTED_FUNCTIONS,
     SUPPORTED_OPS,
     SUPPORTED_SRF_FUNCTIONS,
 )
-from django_safeql.codegen import literal_value
 from django_safeql.exceptions import ValidationError
+from django_safeql.literals import literal_value
 from django_safeql.nodes import (
     Aggregate,
     Alias,
     ArithmeticOp,
     BinaryOp,
     CaseExpr,
+    CastExpr,
     Column,
     ExistsExpr,
     FunctionCall,
@@ -99,10 +102,66 @@ class ValidationVisitor(Visitor):
         if node.limit is not None and self.schema.max_limit is not None and node.limit > self.schema.max_limit:
             raise ValidationError(f"LIMIT exceeds maximum allowed value: {self.schema.max_limit}")
         # Validate every sub-node first (surfaces field/table/operator errors and
-        # resolves column annotations), then enforce GROUP BY coverage on top.
+        # resolves column annotations), then enforce the cross-clause rules on top.
         self.generic_visit(node)
+        self._check_lateral_srf_usage(node)
         self._check_aggregation(node)
         return node
+
+    # -- LATERAL set-returning-function usage ------------------------------
+    #
+    # Elements produced by a LATERAL set-returning function (jsonb_array_elements
+    # and friends) may only be consumed inside a scalar aggregate — the codegen
+    # compiles them to a correlated aggregate subquery and has no meaning for a
+    # bare per-element reference or a collection aggregate over them.
+
+    def _check_lateral_srf_usage(self, node: Query):
+        exprs = []
+        for item in node.select.columns if node.select else []:
+            exprs.append(item.expression if isinstance(item, Alias) else item)
+        exprs.extend(filter(None, [node.where, node.having]))
+        exprs.extend(node.group_by)
+        exprs.extend(order.expression for order in node.order_by)
+        for expr in exprs:
+            self._scan_srf(expr, inside_aggregate=False)
+
+    def _scan_srf(self, expr, inside_aggregate: bool):
+        if expr is None:
+            return
+        if isinstance(expr, Aggregate):
+            if (
+                not inside_aggregate
+                and expr.function.lower() in COLLECTION_AGGREGATES
+                and self._is_srf_expr(expr.expression)
+            ):
+                raise ValidationError(
+                    f"{expr.function.upper()} is not supported over LATERAL set-returning functions; "
+                    "use SUM, COUNT, AVG, MIN or MAX instead"
+                )
+            for child in expr.children():
+                self._scan_srf(child, inside_aggregate=True)
+            return
+        if self._is_srf_ref(expr):
+            if not inside_aggregate:
+                raise ValidationError(
+                    "LATERAL set-returning function elements may only be used inside an "
+                    "aggregate function (SUM, COUNT, AVG, MIN, MAX)"
+                )
+            return
+        for child in expr.children():
+            self._scan_srf(child, inside_aggregate)
+
+    def _is_srf_ref(self, expr) -> bool:
+        if isinstance(expr, Column):
+            return bool(expr.annotations.get("is_lateral_srf_ref"))
+        if isinstance(expr, JsonPath):
+            return bool(expr.annotations.get("is_lateral_path"))
+        return False
+
+    def _is_srf_expr(self, expr) -> bool:
+        if isinstance(expr, CastExpr):
+            expr = expr.expression
+        return self._is_srf_ref(expr)
 
     # -- GROUP BY / aggregation coverage -----------------------------------
     #
@@ -338,6 +397,11 @@ class ValidationVisitor(Visitor):
             self.visit(subquery.where)
         if subquery.select:
             for col in subquery.select.columns:
+                agg = col.expression if isinstance(col, Alias) else col
+                if isinstance(agg, Aggregate) and agg.function.lower() not in SCALAR_AGGREGATES:
+                    raise ValidationError(
+                        f"Aggregate '{agg.function.upper()}' is not supported inside LATERAL/EXISTS subqueries"
+                    )
                 self.visit(col)
         for order in subquery.order_by:
             self.visit(order)

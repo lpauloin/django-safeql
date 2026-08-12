@@ -1,4 +1,3 @@
-import json
 import re
 
 from django.contrib.postgres.aggregates import ArrayAgg as DjangoArrayAgg
@@ -61,13 +60,13 @@ from django.db.models.functions import (
     Upper,
 )
 
-from django_safeql.exceptions import ValidationError
+from django_safeql.casts import normalize_cast_type
+from django_safeql.literals import literal_value
 from django_safeql.nodes import (
     Aggregate,
     Alias,
     And,
     ArithmeticOp,
-    ArrayLiteral,
     BinaryOp,
     BooleanLiteral,
     CaseExpr,
@@ -377,9 +376,8 @@ class CodegenVisitor(Visitor):
 
     def _build_aggregate_subquery(self, inner_qs_base: "QuerySet", agg: Aggregate, subquery_ast: Query) -> "Subquery":
         fn = agg.function.lower()
-        agg_class = AGGREGATE_TO_DJANGO.get(fn)
-        if agg_class is None:
-            raise ValidationError(f"Aggregate '{fn.upper()}' is not supported inside LATERAL subqueries")
+        # Validation guarantees only scalar aggregates reach a LATERAL subquery.
+        agg_class = AGGREGATE_TO_DJANGO[fn]
 
         if isinstance(agg.expression, Column) and agg.expression.name == "*":
             source = "pk"
@@ -760,22 +758,13 @@ class CodegenVisitor(Visitor):
             parts.append(DjangoOrderBy(expr, descending=o.desc))
         return tuple(parts)
 
-    def _reject_lateral_srf(self, node: Aggregate):
-        if self._is_lateral_srf_expr(node.expression):
-            raise ValidationError(
-                f"{node.function.upper()} is not supported over LATERAL set-returning functions. "
-                "Use SUM, COUNT, AVG, MIN, or MAX instead."
-            )
-
     def _build_array_agg(self, node: Aggregate, source=None):
-        self._reject_lateral_srf(node)
         if source is None:
             source = self.expression_for_annotation(node.expression)
         ordering = self._aggregate_order_by(node.order_by)
         return DjangoArrayAgg(source, distinct=node.distinct, ordering=ordering)
 
     def _build_string_agg(self, node: Aggregate, source=None):
-        self._reject_lateral_srf(node)
         if source is None:
             source = self.expression_for_annotation(node.expression)
         delimiter = literal_value(node.extra_args[0]) if node.extra_args else ", "
@@ -785,14 +774,12 @@ class CodegenVisitor(Visitor):
         return DjangoStringAgg(source, delimiter, ordering=ordering)
 
     def _build_json_agg(self, node: Aggregate, source=None):
-        self._reject_lateral_srf(node)
         if source is None:
             source = self.expression_for_annotation(node.expression)
         cls = JsonAgg if node.function.lower() == "json_agg" else JsonbAgg
         return cls(source)
 
     def _build_json_object_agg(self, node: Aggregate, source=None):
-        self._reject_lateral_srf(node)
         cls = JsonObjectAgg if node.function.lower() == "json_object_agg" else JsonbObjectAgg
         if source is None:
             source = self.expression_for_annotation(node.expression)
@@ -825,21 +812,17 @@ class CodegenVisitor(Visitor):
 
     def expression_for_annotation(self, node: Expr):
         if isinstance(node, Column):
+            # Invariant (enforced by validation): a LATERAL SRF reference only
+            # reaches codegen inside an aggregate, handled by aggregate_for_queryset.
             if node.annotations.get("is_lateral_ref") and node.name in self.lateral_fn_sources:
-                raise ValidationError(
-                    f"Cannot use LATERAL alias '{node.name}' directly in a non-aggregate expression. "
-                    "Use an aggregate function (SUM, COUNT, AVG, MIN, MAX) over the lateral elements."
-                )
+                raise RuntimeError(f"Unexpected LATERAL alias {node.name!r} in a non-aggregate expression")
             path = self.visit_Column(node)
             if path == "*":
                 return F("pk")
             return F(path)
         if isinstance(node, JsonPath):
             if node.annotations.get("is_lateral_path"):
-                raise ValidationError(
-                    f"Cannot use LATERAL element field access in a non-aggregate expression. "
-                    "Use an aggregate function (SUM, COUNT, AVG, MIN, MAX) over lateral elements."
-                )
+                raise RuntimeError("Unexpected LATERAL element access in a non-aggregate expression")
             base_path = node.base.annotations["django_path"]
             expr = F(base_path)
             for i, key in enumerate(node.path):
@@ -888,52 +871,12 @@ class CodegenVisitor(Visitor):
             return Case(*whens, **kwargs)
         if isinstance(node, Alias):
             return self.expression_for_annotation(node.expression)
-        raise ValidationError(f"Cannot convert expression to Django annotation: {node}")
+        # Internal invariant: expression shapes reaching codegen are constrained
+        # by the parser and rejected earlier by validation if unsupported.
+        raise RuntimeError(f"Cannot convert expression to Django annotation: {node!r}")
 
     def _expr_label(self, expression) -> str:
         return re.sub(r"\W+", "_", str(expression)).strip("_")[:64] or "expr"
-
-
-def literal_value(node):
-    if isinstance(node, Literal):
-        value = node.value
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped.startswith("{") or stripped.startswith("["):
-                try:
-                    return json.loads(stripped)
-                except json.JSONDecodeError:
-                    return value
-        return value
-    if isinstance(node, NullLiteral):
-        return None
-    if isinstance(node, BooleanLiteral):
-        return node.value
-    if isinstance(node, ArrayLiteral):
-        return [literal_value(v) for v in node.values]
-    raise ValidationError(f"Expected literal value, got {node}")
-
-
-def normalize_cast_type(type_name):
-    value = type_name.lower().strip()
-    value = re.sub(r"\s+", " ", value)
-    if value in {"int", "integer", "int4", "serial", "bigint", "int8", "bigserial"}:
-        return "integer"
-    if value in {"float", "float4", "float8", "double precision", "real"}:
-        return "float"
-    if value.startswith("numeric") or value.startswith("decimal"):
-        return "decimal"
-    if value in {"bool", "boolean"}:
-        return "boolean"
-    if value == "date":
-        return "date"
-    if value in {"timestamp", "timestamp without time zone", "timestamp with time zone", "datetime", "timestamptz"}:
-        return "datetime"
-    if value in {"text", "varchar", "character varying", "char", "character"}:
-        return "string"
-    if value in {"json", "jsonb"}:
-        return "json"
-    raise ValidationError(f"Unsupported cast type: {type_name}")
 
 
 def django_output_field_for_cast(cast_type):
@@ -953,4 +896,5 @@ def django_output_field_for_cast(cast_type):
         return CharField()
     if cast_type == "json":
         return JSONField()
-    raise ValidationError(f"Unsupported codegen cast type: {cast_type}")
+    # Internal invariant: cast_type has already been normalised and validated.
+    raise RuntimeError(f"Unhandled cast type in codegen: {cast_type!r}")

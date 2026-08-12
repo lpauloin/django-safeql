@@ -1,4 +1,4 @@
-from django_safeql.codegen import normalize_cast_type
+from django_safeql.casts import normalize_cast_type
 from django_safeql.json_schema import json_schema_type, JsonSchemaResolver
 from django_safeql.nodes import (
     Aggregate,
@@ -194,7 +194,15 @@ class AnnotationVisitor(Visitor):
         lateral_aliases = self.scope.get("lateral_aliases", {})
         sql_table_candidate = self._resolve_table(node.table) if node.table else node.name
         if node.table is None and node.name in lateral_aliases:
-            node.annotations.update({"is_lateral_ref": True, "lateral_alias": node.name, "django_path": node.name})
+            is_srf = lateral_aliases[node.name].fn_call is not None
+            node.annotations.update(
+                {
+                    "is_lateral_ref": True,
+                    "is_lateral_srf_ref": is_srf,
+                    "lateral_alias": node.name,
+                    "django_path": node.name,
+                }
+            )
             return node
         if node.table is not None and sql_table_candidate in lateral_aliases:
             lateral_join_node = lateral_aliases[sql_table_candidate]
@@ -212,6 +220,7 @@ class AnnotationVisitor(Visitor):
                 node.annotations.update(
                     {
                         "is_lateral_ref": True,
+                        "is_lateral_srf_ref": True,
                         "lateral_alias": sql_table_candidate,
                         "django_path": sql_table_candidate,
                     }
@@ -287,7 +296,11 @@ class AnnotationVisitor(Visitor):
 
     def visit_CastExpr(self, node: CastExpr):
         self.visit(node.expression)
-        node.annotations["cast_type"] = normalize_cast_type(node.target_type)
+        cast_type = normalize_cast_type(node.target_type)
+        if cast_type is None:
+            node.annotations["error"] = f"Unsupported cast type: {node.target_type}"
+        else:
+            node.annotations["cast_type"] = cast_type
         return node
 
     def visit_Aggregate(self, node: Aggregate):
