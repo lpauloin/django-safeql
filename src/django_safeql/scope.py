@@ -1,5 +1,7 @@
 from contextlib import contextmanager
 
+NODE_TYPES = "node_types"
+
 
 class ScopeStack:
     def __init__(self):
@@ -58,6 +60,27 @@ class ScopeStack:
         if not isinstance(mapping, dict):
             raise RuntimeError(f"Scope key {key!r} is not a dict")
         return mapping
+
+    # -- Subtree type recording -------------------------------------------
+    #
+    # A scope can ask "what node types live under me?" without walking its own
+    # subtree: it calls record_types(), and every node announced during the walk
+    # below lands in that set. Read as a whitelist, a node type nobody planned for
+    # shows up in the set instead of slipping through unnoticed.
+
+    def record_types(self):
+        """Start recording, on the current scope, the node types living below it."""
+        self.set(NODE_TYPES, set())
+
+    def announce(self, node_type):
+        """Record a node type into the nearest recording scope, if any."""
+        for frame in reversed(self.stack):
+            if NODE_TYPES in frame:
+                frame[NODE_TYPES].add(node_type)
+                return
+
+    def types(self):
+        return self.get(NODE_TYPES, set())
 
     def __len__(self):
         return len(self.stack)

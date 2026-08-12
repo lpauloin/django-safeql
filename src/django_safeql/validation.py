@@ -1,4 +1,5 @@
 from django_safeql.constants import (
+    ALLOWED_NODE_TYPES,
     COLLECTION_AGGREGATES,
     SCALAR_AGGREGATES,
     SUPPORTED_AGGREGATES,
@@ -91,6 +92,7 @@ class ValidationVisitor(Visitor):
         self.schema = schema
 
     def visit_Query(self, node: Query):
+        self._check_node_types(node)
         if not node.from_:
             raise ValidationError("Missing FROM clause")
         if node.having and not node.group_by:
@@ -102,6 +104,14 @@ class ValidationVisitor(Visitor):
         self.generic_visit(node)
         self._check_aggregation(node)
         return node
+
+    def _check_node_types(self, node: Query):
+        # Fail-closed: reject any node type the pipeline does not explicitly handle,
+        # rather than letting it slip through unvalidated.
+        unknown = node.annotations.get("node_types", set()) - ALLOWED_NODE_TYPES
+        if unknown:
+            name = sorted(cls.__name__ for cls in unknown)[0]
+            raise ValidationError(f"Unsupported expression: {name}")
 
     # -- Schema resolution decisions ---------------------------------------
     #

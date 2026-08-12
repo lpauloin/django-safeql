@@ -35,8 +35,16 @@ class AnnotationVisitor(Visitor):
         self.scope = ScopeStack()
         self.json_resolver = JsonSchemaResolver()
 
+    def visit(self, node, *args, **kwargs):
+        # Every visited node announces its type to the recording (sub)query scope,
+        # so each query knows exactly what it is made of (see ScopeStack.record_types).
+        if node is not None:
+            self.scope.announce(type(node))
+        return super().visit(node, *args, **kwargs)
+
     def visit_Query(self, node: Query):
         with self.scope.scoped(node, alias_to_table={}, select_aliases={}, lateral_aliases={}):
+            self.scope.record_types()
             self.visit(node.from_)
             for join in node.joins:
                 self.visit(join)
@@ -50,6 +58,7 @@ class AnnotationVisitor(Visitor):
             node.annotations["base_queryset"] = self.schema.base_queryset
             node.annotations["base_model"] = self.schema.base_model
             node.annotations["select_aliases"] = dict(self.scope.get("select_aliases", {}))
+            node.annotations["node_types"] = set(self.scope.types())
         return node
 
     def visit_From(self, node: From):
@@ -111,6 +120,7 @@ class AnnotationVisitor(Visitor):
             outer_alias_to_table=outer_alias_to_table,
             inner_table_name=inner_table_name,
         ):
+            self.scope.record_types()
             if subquery.select:
                 for col in subquery.select.columns:
                     self.visit(col)
@@ -119,6 +129,7 @@ class AnnotationVisitor(Visitor):
                 self.visit(order)
             for gb in subquery.group_by:
                 self.visit(gb)
+            subquery.annotations["node_types"] = set(self.scope.types())
         subquery.annotations.update(
             {
                 "inner_model": inner_table_schema.model,

@@ -1,3 +1,5 @@
+from django_safeql import nodes
+
 # ---------------------------------------------------------------------------
 # Operators
 # ---------------------------------------------------------------------------
@@ -112,3 +114,42 @@ SUPPORTED_SRF_FUNCTIONS = frozenset({"jsonb_array_elements", "jsonb_array_elemen
 # ---------------------------------------------------------------------------
 
 SUPPORTED_FUNCTIONS = STRING_FUNCTIONS | DATE_FUNCTIONS | JSON_FUNCTIONS
+
+# ---------------------------------------------------------------------------
+# AST node types
+# ---------------------------------------------------------------------------
+
+# Every node class the pipeline explicitly handles. Recorded per query during
+# annotation and checked fail-closed by validation: a node type nobody planned
+# for is rejected instead of slipping through the whitelist unnoticed.
+ALLOWED_NODE_TYPES = frozenset(
+    {
+        nodes.Query,
+        nodes.Select,
+        nodes.From,
+        nodes.Join,
+        nodes.OrderBy,
+        nodes.Column,
+        nodes.Literal,
+        nodes.NullLiteral,
+        nodes.BooleanLiteral,
+        nodes.ArrayLiteral,
+        nodes.BinaryOp,
+        nodes.ArithmeticOp,
+        nodes.FunctionCall,
+        nodes.CaseExpr,
+        nodes.And,
+        nodes.Or,
+        nodes.Not,
+        nodes.JsonPath,
+        nodes.JsonContains,
+        nodes.JsonHasKey,
+        nodes.JsonHasAnyKeys,
+        nodes.JsonHasAllKeys,
+        nodes.CastExpr,
+        nodes.Alias,
+        nodes.Aggregate,
+        nodes.LateralJoin,
+        nodes.ExistsExpr,
+    }
+)
