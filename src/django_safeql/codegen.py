@@ -654,8 +654,6 @@ class CodegenVisitor(Visitor):
             value = self.expression_for_annotation(node.right)
         else:
             value = literal_value(node.right)
-        if isinstance(value, str) and value.startswith("__field__:"):
-            value = F(value.removeprefix("__field__:"))
         if node.op == "!=":
             return ~Q(**{field: value})
         lookup = OP_TO_LOOKUP[node.op]
@@ -670,8 +668,8 @@ class CodegenVisitor(Visitor):
     def visit_JsonPath(self, node: JsonPath) -> str:
         return node.annotations["django_path"]
 
-    def visit_Literal(self, node: Literal) -> str:
-        return f"__field__:{node.value}"
+    def visit_Literal(self, node: Literal):
+        return Value(node.value)
 
     def visit_CastExpr(self, node: CastExpr) -> str:
         source = self.expression_for_annotation(node.expression)

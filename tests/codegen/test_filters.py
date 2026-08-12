@@ -98,6 +98,17 @@ def test_like_complex_internal_wildcard(library):
     assert ids(qs) == [library.d1.id, library.d2.id, library.d4.id]
 
 
+def test_field_sentinel_literal_is_not_a_field_reference(library):
+    # A user literal starting with the internal "__field__:" prefix must stay a
+    # bound value — never become an F() field/relation reference, which would
+    # bypass the table/field whitelist and join to undeclared related tables.
+    qs = library.transpiler.to_queryset("SELECT book.id FROM book WHERE book.status = '__field__:author__name'")
+    sql, params = qs.query.sql_with_params()
+    assert "__field__:author__name" in params
+    assert "JOIN" not in sql.upper()
+    assert list(qs) == []
+
+
 def test_like_exact_match(library):
     qs = library.transpiler.to_queryset(
         "SELECT book.* FROM book WHERE book.title LIKE 'letters-one.txt' ORDER BY book.id ASC"
