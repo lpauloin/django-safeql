@@ -177,10 +177,10 @@ class AnnotationVisitor(Visitor):
                     node.annotations.update(
                         {
                             "is_outer_ref": True,
-                            "outer_table_schema": outer_table_schema,
                             "outer_table_name": outer_table_name,
                             "outer_field_name": node.name,
                             "outer_django_path": outer_django_path,
+                            "field_allowed": self._field_allowed(outer_table_schema, node.name),
                         }
                     )
                     return node
@@ -238,6 +238,7 @@ class AnnotationVisitor(Visitor):
                 "relation": relation,
                 "django_path": f"{relation}__{node.name}" if relation else node.name,
                 "is_json_field": node.name in table_schema.json_fields,
+                "field_allowed": self._field_allowed(table_schema, node.name),
             }
         )
         return node
@@ -310,3 +311,16 @@ class AnnotationVisitor(Visitor):
         if not table:
             return self.schema.base_table
         return self.scope.get("alias_to_table", {}).get(table, table)
+
+    def _field_allowed(self, table_schema, field_name: str) -> bool:
+        """Whether ``field_name`` is reachable on ``table_schema`` per its whitelist.
+
+        Pure schema/model introspection — a fact the validation layer consumes as
+        a boolean without needing to know how it was derived.
+        """
+        if table_schema.allowed_fields is not None:
+            return field_name in table_schema.allowed_fields
+        model_field_names = {f.name for f in table_schema.model._meta.get_fields()}
+        db_column_names = {getattr(f, "column", None) for f in table_schema.model._meta.fields}
+        json_field_names = set(table_schema.json_fields.keys())
+        return field_name in model_field_names or field_name in db_column_names or field_name in json_field_names

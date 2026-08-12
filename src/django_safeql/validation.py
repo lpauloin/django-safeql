@@ -30,7 +30,7 @@ from django_safeql.nodes import (
     Query,
     Select,
 )
-from django_safeql.schemas import SQLTranspilerSchema, TableSchema
+from django_safeql.schemas import SQLTranspilerSchema
 from django_safeql.visitor import Visitor
 
 # None = any arity; int = exact; tuple = (min, max) where max=None means unbounded
@@ -125,17 +125,16 @@ class ValidationVisitor(Visitor):
 
     def visit_Column(self, node: Column):
         if node.annotations.get("is_outer_ref"):
-            table_schema = node.annotations["outer_table_schema"]
-            field_name = node.annotations["outer_field_name"]
-            if not self._field_allowed(table_schema, field_name):
-                raise ValidationError(f"Unknown field: {node.annotations['outer_table_name']}.{field_name}")
+            if not node.annotations["field_allowed"]:
+                raise ValidationError(
+                    f"Unknown field: {node.annotations['outer_table_name']}.{node.annotations['outer_field_name']}"
+                )
             return node
         if node.annotations.get("is_lateral_ref") or node.annotations.get("select_alias"):
             return node
-        table_schema = node.annotations.get("table_schema")
-        if table_schema is None:
+        if node.annotations.get("table_schema") is None:
             raise ValidationError(f"Unknown table for column: {node.table}")
-        if node.name != "*" and not self._field_allowed(table_schema, node.name):
+        if node.name != "*" and not node.annotations["field_allowed"]:
             raise ValidationError(f"Unknown field: {node.annotations['sql_table']}.{node.name}")
         return node
 
@@ -144,15 +143,6 @@ class ValidationVisitor(Visitor):
             raise ValidationError(f"Unsupported cast type: {node.target_type}")
         self.visit(node.expression)
         return node
-
-    def _field_allowed(self, table_schema: TableSchema, field_name: str) -> bool:
-        """Whether ``field_name`` is reachable on ``table_schema`` per its whitelist."""
-        if table_schema.allowed_fields is not None:
-            return field_name in table_schema.allowed_fields
-        model_field_names = {f.name for f in table_schema.model._meta.get_fields()}
-        db_column_names = {getattr(f, "column", None) for f in table_schema.model._meta.fields}
-        json_field_names = set(table_schema.json_fields.keys())
-        return field_name in model_field_names or field_name in db_column_names or field_name in json_field_names
 
     # -- LATERAL set-returning-function usage ------------------------------
     #
