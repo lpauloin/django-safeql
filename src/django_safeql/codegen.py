@@ -242,21 +242,6 @@ FUNCTION_TO_DJANGO = {
     ),
 }
 
-TEXT_FUNCTIONS = frozenset(
-    [
-        "lower",
-        "upper",
-        "trim",
-        "ltrim",
-        "rtrim",
-        "substring",
-        "substr",
-        "concat",
-        "replace",
-        "coalesce",
-    ]
-)
-
 
 class StaticRows:
     """Small iterable result used for SQL aggregate() output."""
@@ -833,11 +818,8 @@ class CodegenVisitor(Visitor):
             if node.op == "%":
                 return left % right
         if isinstance(node, nodes.FunctionCall):
-            name = node.name.lower()
-            function = FUNCTION_TO_DJANGO[name]
+            function = FUNCTION_TO_DJANGO[node.name.lower()]
             args = [self.expression_for_annotation(arg) for arg in node.args]
-            if name in TEXT_FUNCTIONS:
-                return function(*args, output_field=CharField())
             return function(*args)
         if isinstance(node, nodes.CaseExpr):
             whens = [

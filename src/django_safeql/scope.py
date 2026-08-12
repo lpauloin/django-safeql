@@ -33,22 +33,11 @@ class ScopeStack:
             raise RuntimeError("No active scope")
         self.stack[-1][key] = value
 
-    def update(self, **values):
-        if not self.stack:
-            raise RuntimeError("No active scope")
-        self.stack[-1].update(values)
-
     def get(self, key, default=None):
         for frame in reversed(self.stack):
             if key in frame:
                 return frame[key]
         return default
-
-    def require(self, key):
-        value = self.get(key)
-        if value is None:
-            raise RuntimeError(f"Missing scope key: {key}")
-        return value
 
     def mutate_mapping(self, key):
         current_frame = self.stack[-1]

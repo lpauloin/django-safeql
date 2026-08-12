@@ -28,7 +28,6 @@ class SQLTranspilerSchema:
     base_queryset: QuerySet
     tables: dict[str, TableSchema]
     max_limit: int | None = 1000
-    lateral_functions: dict[str, str] = dataclass_field(default_factory=dict)
 
     @property
     def base_model(self):
