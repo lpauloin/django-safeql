@@ -60,35 +60,9 @@ from django.db.models.functions import (
     Upper,
 )
 
+from django_safeql import nodes
 from django_safeql.casts import normalize_cast_type, postgres_cast_type
 from django_safeql.literals import literal_value
-from django_safeql.nodes import (
-    Aggregate,
-    Alias,
-    And,
-    ArithmeticOp,
-    BinaryOp,
-    BooleanLiteral,
-    CaseExpr,
-    CastExpr,
-    Column,
-    ExistsExpr,
-    Expr,
-    FunctionCall,
-    JsonContains,
-    JsonHasAllKeys,
-    JsonHasAnyKeys,
-    JsonHasKey,
-    JsonPath,
-    LateralJoin,
-    Literal,
-    Not,
-    NullLiteral,
-    Or,
-    OrderBy,
-    Query,
-    Select,
-)
 from django_safeql.visitor import Visitor
 
 OP_TO_LOOKUP = {
@@ -315,27 +289,27 @@ class CodegenVisitor(Visitor):
         safe_prefix = re.sub(r"\W+", "_", prefix).strip("_") or "expr"
         return f"_sql_{safe_prefix[:48]}_{self.annotation_counter}"
 
-    def visit_Query(self, node: Query) -> QuerySet:
-        if any(isinstance(j, LateralJoin) for j in node.joins):
+    def visit_Query(self, node: nodes.Query) -> QuerySet:
+        if any(isinstance(j, nodes.LateralJoin) for j in node.joins):
             return self._visit_lateral_query(node)
         return self._visit_query_in_scope(node)
 
-    def _visit_lateral_query(self, node: Query) -> "QuerySet | StaticRows":
+    def _visit_lateral_query(self, node: nodes.Query) -> "QuerySet | StaticRows":
         qs = node.annotations["base_queryset"]
         for join in node.joins:
-            if isinstance(join, LateralJoin) and join.fn_call:
+            if isinstance(join, nodes.LateralJoin) and join.fn_call:
                 self._register_lateral_fn_call(join)
-            elif isinstance(join, LateralJoin) and join.subquery:
+            elif isinstance(join, nodes.LateralJoin) and join.subquery:
                 qs = self._annotate_lateral_subquery(qs, join)
         node.annotations["base_queryset"] = qs
         return self._visit_query_in_scope(node)
 
-    def _register_lateral_fn_call(self, join: LateralJoin):
+    def _register_lateral_fn_call(self, join: nodes.LateralJoin):
         fn_name = join.annotations.get("fn_name") or join.fn_call.name.lower()
         source_expr = self.expression_for_annotation(join.fn_call.args[0]) if join.fn_call.args else None
         self.lateral_fn_sources[join.alias] = (fn_name, source_expr)
 
-    def _annotate_lateral_subquery(self, qs: "QuerySet", lateral_join: LateralJoin) -> "QuerySet":
+    def _annotate_lateral_subquery(self, qs: "QuerySet", lateral_join: nodes.LateralJoin) -> "QuerySet":
         subquery_ast = lateral_join.subquery
         inner_model = lateral_join.annotations.get("inner_model")
         alias = lateral_join.alias
@@ -345,7 +319,7 @@ class CodegenVisitor(Visitor):
         for selected in subquery_ast.select.columns if subquery_ast.select else []:
             col_node, col_alias = (
                 (selected.expression, selected.alias)
-                if isinstance(selected, Alias)
+                if isinstance(selected, nodes.Alias)
                 else (selected, getattr(selected, "name", None))
             )
 
@@ -353,7 +327,7 @@ class CodegenVisitor(Visitor):
                 continue
             ann_key = f"{alias}_{col_alias}"
 
-            if isinstance(col_node, Aggregate):
+            if isinstance(col_node, nodes.Aggregate):
                 subq = self._build_aggregate_subquery(inner_qs_base, col_node, subquery_ast)
             else:
                 inner_field = col_node.annotations.get("django_path", getattr(col_node, "name", col_alias))
@@ -368,18 +342,20 @@ class CodegenVisitor(Visitor):
 
         if lateral_join.join_type == "cross" and subquery_ast.select and subquery_ast.select.columns:
             first = subquery_ast.select.columns[0]
-            first_alias = first.alias if isinstance(first, Alias) else getattr(first, "name", None)
+            first_alias = first.alias if isinstance(first, nodes.Alias) else getattr(first, "name", None)
             if first_alias:
                 qs = qs.filter(**{f"{alias}_{first_alias}__isnull": False})
 
         return qs
 
-    def _build_aggregate_subquery(self, inner_qs_base: "QuerySet", agg: Aggregate, subquery_ast: Query) -> "Subquery":
+    def _build_aggregate_subquery(
+        self, inner_qs_base: "QuerySet", agg: nodes.Aggregate, subquery_ast: nodes.Query
+    ) -> "Subquery":
         fn = agg.function.lower()
         # Validation guarantees only scalar aggregates reach a LATERAL subquery.
         agg_class = AGGREGATE_TO_DJANGO[fn]
 
-        if isinstance(agg.expression, Column) and agg.expression.name == "*":
+        if isinstance(agg.expression, nodes.Column) and agg.expression.name == "*":
             source = "pk"
         else:
             source = agg.expression.annotations.get("django_path", getattr(agg.expression, "name", "pk"))
@@ -403,19 +379,19 @@ class CodegenVisitor(Visitor):
         """Find the inner field used in a correlated (OuterRef) equality condition."""
         if where_node is None:
             return None
-        if isinstance(where_node, (And, Not)):
+        if isinstance(where_node, (nodes.And, nodes.Not)):
             left = getattr(where_node, "left", None) or getattr(where_node, "expr", None)
             right = getattr(where_node, "right", None)
             return self._find_correlated_field(left) or self._find_correlated_field(right)
-        if isinstance(where_node, BinaryOp) and where_node.op == "=":
+        if isinstance(where_node, nodes.BinaryOp) and where_node.op == "=":
             lft, rgt = where_node.left, where_node.right
-            if rgt.annotations.get("is_outer_ref") and isinstance(lft, Column):
+            if rgt.annotations.get("is_outer_ref") and isinstance(lft, nodes.Column):
                 return lft.annotations.get("django_path", lft.name)
-            if lft.annotations.get("is_outer_ref") and isinstance(rgt, Column):
+            if lft.annotations.get("is_outer_ref") and isinstance(rgt, nodes.Column):
                 return rgt.annotations.get("django_path", rgt.name)
         return None
 
-    def _build_inner_queryset(self, subquery_ast: Query, inner_model) -> "QuerySet":
+    def _build_inner_queryset(self, subquery_ast: nodes.Query, inner_model) -> "QuerySet":
         saved = self.annotate_kwargs
         self.annotate_kwargs = {}
         qs = inner_model.objects.all()
@@ -432,16 +408,16 @@ class CodegenVisitor(Visitor):
         """Return (fn_name, source_expr, element_key, cast_type) if expr references a lateral SRF alias, else None."""
         cast_type = None
         inner = expr
-        if isinstance(inner, CastExpr):
+        if isinstance(inner, nodes.CastExpr):
             cast_type = inner.annotations.get("cast_type") or normalize_cast_type(inner.target_type)
             inner = inner.expression
-        if isinstance(inner, JsonPath) and inner.annotations.get("is_lateral_path"):
+        if isinstance(inner, nodes.JsonPath) and inner.annotations.get("is_lateral_path"):
             alias = inner.annotations["lateral_alias"]
             if alias in self.lateral_fn_sources:
                 fn_name, source_expr = self.lateral_fn_sources[alias]
                 element_key = str(inner.path[0]) if inner.path else None
                 return fn_name, source_expr, element_key, cast_type
-        if isinstance(inner, Column) and inner.annotations.get("is_lateral_ref"):
+        if isinstance(inner, nodes.Column) and inner.annotations.get("is_lateral_ref"):
             alias = inner.annotations.get("lateral_alias", inner.name)
             if alias in self.lateral_fn_sources:
                 fn_name, source_expr = self.lateral_fn_sources[alias]
@@ -449,7 +425,7 @@ class CodegenVisitor(Visitor):
         return None
 
     def _is_lateral_srf_expr(self, expr) -> bool:
-        inner = expr.expression if isinstance(expr, CastExpr) else expr
+        inner = expr.expression if isinstance(expr, nodes.CastExpr) else expr
         return bool(inner is not None and inner.annotations.get("is_srf_ref"))
 
     def _agg_output_field(self, function: str, cast_type: str | None = None):
@@ -463,7 +439,7 @@ class CodegenVisitor(Visitor):
             return DecimalField(max_digits=30, decimal_places=10)
         return FloatField()
 
-    def visit_ExistsExpr(self, node: "ExistsExpr") -> "Q":
+    def visit_ExistsExpr(self, node: nodes.ExistsExpr) -> "Q":
         subquery = node.subquery
         inner_model = subquery.annotations.get("inner_model")
         inner_qs = self._build_inner_queryset(subquery, inner_model)
@@ -471,7 +447,7 @@ class CodegenVisitor(Visitor):
         self.annotate_kwargs[ann_name] = DjangoExists(inner_qs)
         return Q(**{ann_name: True})
 
-    def _visit_query_in_scope(self, node: Query) -> QuerySet:
+    def _visit_query_in_scope(self, node: nodes.Query) -> QuerySet:
         qs = node.annotations["base_queryset"]
 
         where_q = self.visit(node.where) if node.where else None
@@ -487,8 +463,8 @@ class CodegenVisitor(Visitor):
             pre_collected: set[str] = set()
             for selected in node.select.columns if node.select else []:
                 if (
-                    isinstance(selected, Alias)
-                    and not isinstance(selected.expression, Aggregate)
+                    isinstance(selected, nodes.Alias)
+                    and not isinstance(selected.expression, nodes.Aggregate)
                     and selected.alias in group_field_set
                 ):
                     self._collect_select_expression(selected)
@@ -496,7 +472,7 @@ class CodegenVisitor(Visitor):
             qs = self._flush_annotations(qs)
             qs = qs.values(*group_fields)
             for selected in node.select.columns if node.select else []:
-                if isinstance(selected, Alias) and selected.alias in pre_collected:
+                if isinstance(selected, nodes.Alias) and selected.alias in pre_collected:
                     continue
                 self._collect_select_expression(selected)
             qs = self._flush_annotations(qs)
@@ -521,25 +497,25 @@ class CodegenVisitor(Visitor):
             qs = qs[: node.limit]
         return qs
 
-    def _select_has_aggregate(self, select: Select | None) -> bool:
+    def _select_has_aggregate(self, select: nodes.Select | None) -> bool:
         if not select:
             return False
         for expr_ in select.columns:
-            if isinstance(expr_, Aggregate):
+            if isinstance(expr_, nodes.Aggregate):
                 return True
-            if isinstance(expr_, Alias) and isinstance(expr_.expression, Aggregate):
+            if isinstance(expr_, nodes.Alias) and isinstance(expr_.expression, nodes.Aggregate):
                 return True
         return False
 
-    def _aggregate_without_group_by(self, qs: QuerySet, node: Query) -> StaticRows:
+    def _aggregate_without_group_by(self, qs: QuerySet, node: nodes.Query) -> StaticRows:
         aggregate_kwargs = {}
         srf_pre_annotations = {}
 
         for selected in node.select.columns if node.select else []:
-            aggregate = selected.expression if isinstance(selected, Alias) else selected
+            aggregate = selected.expression if isinstance(selected, nodes.Alias) else selected
             alias = (
                 selected.alias
-                if isinstance(selected, Alias)
+                if isinstance(selected, nodes.Alias)
                 else aggregate.alias or self.next_alias(aggregate.function)
             )
             agg_expr = self.aggregate_for_queryset(aggregate)
@@ -566,7 +542,7 @@ class CodegenVisitor(Visitor):
             self.annotate_kwargs = {}
         return qs
 
-    def _group_by_value_fields(self, node: Query) -> list[str]:
+    def _group_by_value_fields(self, node: nodes.Query) -> list[str]:
         # Every GROUP BY expression becomes a .values() field, whether or not it's
         # also selected — SQL doesn't require them to match, and dropping a GROUP BY
         # column just because it isn't selected would silently turn an aggregate
@@ -575,19 +551,19 @@ class CodegenVisitor(Visitor):
         group_paths = [self.visit(expr_) for expr_ in node.group_by]
         return list(dict.fromkeys(group_paths))
 
-    def _plain_select_value_fields(self, select: Select | None) -> list[str]:
+    def _plain_select_value_fields(self, select: nodes.Select | None) -> list[str]:
         if not select:
             return []
         fields: list[str] = []
         for expr_ in select.columns:
-            if isinstance(expr_, Column):
+            if isinstance(expr_, nodes.Column):
                 if expr_.name == "*":
                     fields.extend(self._select_all_value_fields(expr_))
                 else:
                     fields.append(self.visit_Column(expr_))
-            elif isinstance(expr_, Alias):
+            elif isinstance(expr_, nodes.Alias):
                 alias = expr_.alias
-                if isinstance(expr_.expression, Column) and expr_.expression.name != "*":
+                if isinstance(expr_.expression, nodes.Column) and expr_.expression.name != "*":
                     self.annotate_kwargs[alias] = F(self.visit_Column(expr_.expression))
                     fields.append(alias)
                 else:
@@ -596,7 +572,7 @@ class CodegenVisitor(Visitor):
                 self.codegen_aliases[alias] = alias
         return fields
 
-    def _select_all_value_fields(self, node: Column) -> list[str]:
+    def _select_all_value_fields(self, node: nodes.Column) -> list[str]:
         table_schema = node.annotations["table_schema"]
         relation = node.annotations.get("relation", "")
         field_names = self._selectable_field_names(table_schema)
@@ -612,28 +588,28 @@ class CodegenVisitor(Visitor):
         extra_allowed = sorted(allowed_fields - set(concrete_allowed))
         return [*concrete_allowed, *extra_allowed]
 
-    def _collect_select_expression(self, node: Expr):
-        if isinstance(node, Alias):
-            if isinstance(node.expression, Aggregate):
+    def _collect_select_expression(self, node: nodes.Expr):
+        if isinstance(node, nodes.Alias):
+            if isinstance(node.expression, nodes.Aggregate):
                 self.visit_Aggregate(node.expression, forced_alias=node.alias)
             else:
                 self.annotate_kwargs[node.alias] = self.expression_for_annotation(node.expression)
             self.codegen_aliases[node.alias] = node.alias
             return
-        if isinstance(node, Aggregate):
+        if isinstance(node, nodes.Aggregate):
             self.visit_Aggregate(node)
             return
 
-    def visit_And(self, node: And) -> Q:
+    def visit_And(self, node: nodes.And) -> Q:
         return self.visit(node.left) & self.visit(node.right)
 
-    def visit_Or(self, node: Or) -> Q:
+    def visit_Or(self, node: nodes.Or) -> Q:
         return self.visit(node.left) | self.visit(node.right)
 
-    def visit_Not(self, node: Not) -> Q:
+    def visit_Not(self, node: nodes.Not) -> Q:
         return ~self.visit(node.expr)
 
-    def visit_BinaryOp(self, node: BinaryOp) -> Q:
+    def visit_BinaryOp(self, node: nodes.BinaryOp) -> Q:
         if node.op == "IN":
             field = self.visit(node.left)
             return Q(**{f"{field}__in": literal_value(node.right)})
@@ -650,7 +626,18 @@ class CodegenVisitor(Visitor):
         field = self.visit(node.left)
         if node.right.annotations.get("is_outer_ref"):
             value = OuterRef(node.right.annotations["outer_django_path"])
-        elif isinstance(node.right, (Column, JsonPath, CastExpr, ArithmeticOp, FunctionCall, Aggregate, Alias)):
+        elif isinstance(
+            node.right,
+            (
+                nodes.Column,
+                nodes.JsonPath,
+                nodes.CastExpr,
+                nodes.ArithmeticOp,
+                nodes.FunctionCall,
+                nodes.Aggregate,
+                nodes.Alias,
+            ),
+        ):
             value = self.expression_for_annotation(node.right)
         else:
             value = literal_value(node.right)
@@ -659,43 +646,43 @@ class CodegenVisitor(Visitor):
         lookup = OP_TO_LOOKUP[node.op]
         return Q(**{f"{field}__{lookup}" if lookup else field: value})
 
-    def visit_Column(self, node: Column):
+    def visit_Column(self, node: nodes.Column):
         path = node.annotations.get("django_path", node.name)
         if node.annotations.get("select_alias"):
             return self.codegen_aliases.get(path, path)
         return path
 
-    def visit_JsonPath(self, node: JsonPath) -> str:
+    def visit_JsonPath(self, node: nodes.JsonPath) -> str:
         return node.annotations["django_path"]
 
-    def visit_Literal(self, node: Literal):
+    def visit_Literal(self, node: nodes.Literal):
         return Value(node.value)
 
-    def visit_CastExpr(self, node: CastExpr) -> str:
+    def visit_CastExpr(self, node: nodes.CastExpr) -> str:
         source = self.expression_for_annotation(node.expression)
         cast_type = node.annotations.get("cast_type") or normalize_cast_type(node.target_type)
         alias = self.next_alias(f"{self._expr_label(source)}_{cast_type}")
         self.annotate_kwargs[alias] = Cast(source, output_field=django_output_field_for_cast(cast_type))
         return alias
 
-    def visit_ArithmeticOp(self, node: ArithmeticOp) -> str:
+    def visit_ArithmeticOp(self, node: nodes.ArithmeticOp) -> str:
         expression = self.expression_for_annotation(node)
         alias = self.next_alias(self._expr_label(expression))
         self.annotate_kwargs[alias] = expression
         return alias
 
-    def visit_FunctionCall(self, node: FunctionCall) -> str:
+    def visit_FunctionCall(self, node: nodes.FunctionCall) -> str:
         expression = self.expression_for_annotation(node)
         alias = self.next_alias(f"{node.name}_{self._expr_label(expression)}")
         self.annotate_kwargs[alias] = expression
         return alias
 
-    def visit_Alias(self, node: Alias) -> str:
-        if isinstance(node.expression, Aggregate):
+    def visit_Alias(self, node: nodes.Alias) -> str:
+        if isinstance(node.expression, nodes.Aggregate):
             return self.visit_Aggregate(node.expression, forced_alias=node.alias)
         return node.alias
 
-    def visit_Aggregate(self, node: Aggregate, forced_alias: str | None = None) -> str:
+    def visit_Aggregate(self, node: nodes.Aggregate, forced_alias: str | None = None) -> str:
         function = node.function.lower()
         source = self.aggregate_source(node)
         aggregate = self.aggregate_for_queryset(node, source=source)
@@ -713,7 +700,7 @@ class CodegenVisitor(Visitor):
         self.codegen_aliases[alias] = alias
         return alias
 
-    def aggregate_for_queryset(self, node: Aggregate, source=None):
+    def aggregate_for_queryset(self, node: nodes.Aggregate, source=None):
         function = node.function.lower()
 
         if function == "array_agg":
@@ -727,7 +714,7 @@ class CodegenVisitor(Visitor):
 
         aggregate_class = AGGREGATE_TO_DJANGO[function]
         # Lateral SRF aggregate: build a correlated scalar subquery instead of a plain aggregate.
-        if not (isinstance(node.expression, Column) and node.expression.name == "*"):
+        if not (isinstance(node.expression, nodes.Column) and node.expression.name == "*"):
             srf_info = self._extract_lateral_srf_info(node.expression)
             if srf_info is not None:
                 fn_name, source_expr, element_key, cast_type = srf_info
@@ -750,13 +737,13 @@ class CodegenVisitor(Visitor):
             parts.append(DjangoOrderBy(expr, descending=o.desc))
         return tuple(parts)
 
-    def _build_array_agg(self, node: Aggregate, source=None):
+    def _build_array_agg(self, node: nodes.Aggregate, source=None):
         if source is None:
             source = self.expression_for_annotation(node.expression)
         ordering = self._aggregate_order_by(node.order_by)
         return DjangoArrayAgg(source, distinct=node.distinct, ordering=ordering)
 
-    def _build_string_agg(self, node: Aggregate, source=None):
+    def _build_string_agg(self, node: nodes.Aggregate, source=None):
         if source is None:
             source = self.expression_for_annotation(node.expression)
         delimiter = literal_value(node.extra_args[0]) if node.extra_args else ", "
@@ -765,45 +752,45 @@ class CodegenVisitor(Visitor):
         ordering = self._aggregate_order_by(node.order_by)
         return DjangoStringAgg(source, delimiter, ordering=ordering)
 
-    def _build_json_agg(self, node: Aggregate, source=None):
+    def _build_json_agg(self, node: nodes.Aggregate, source=None):
         if source is None:
             source = self.expression_for_annotation(node.expression)
         cls = JsonAgg if node.function.lower() == "json_agg" else JsonbAgg
         return cls(source)
 
-    def _build_json_object_agg(self, node: Aggregate, source=None):
+    def _build_json_object_agg(self, node: nodes.Aggregate, source=None):
         cls = JsonObjectAgg if node.function.lower() == "json_object_agg" else JsonbObjectAgg
         if source is None:
             source = self.expression_for_annotation(node.expression)
         value = self.expression_for_annotation(node.extra_args[0]) if node.extra_args else Value(None)
         return cls(source, value)
 
-    def aggregate_source(self, node: Aggregate):
-        if isinstance(node.expression, Column) and node.expression.name == "*":
+    def aggregate_source(self, node: nodes.Aggregate):
+        if isinstance(node.expression, nodes.Column) and node.expression.name == "*":
             return "pk"
         # Lateral SRF refs are handled by aggregate_for_queryset — return safe placeholder.
         if self._is_lateral_srf_expr(node.expression):
             return "pk"
         return self.expression_for_annotation(node.expression)
 
-    def visit_JsonContains(self, node: JsonContains) -> Q:
+    def visit_JsonContains(self, node: nodes.JsonContains) -> Q:
         return Q(**{f"{self.visit(node.left)}__contains": literal_value(node.value)})
 
-    def visit_JsonHasKey(self, node: JsonHasKey) -> Q:
+    def visit_JsonHasKey(self, node: nodes.JsonHasKey) -> Q:
         return Q(**{f"{self.visit(node.left)}__has_key": literal_value(node.key)})
 
-    def visit_JsonHasAnyKeys(self, node: JsonHasAnyKeys) -> Q:
+    def visit_JsonHasAnyKeys(self, node: nodes.JsonHasAnyKeys) -> Q:
         return Q(**{f"{self.visit(node.left)}__has_any_keys": literal_value(node.keys)})
 
-    def visit_JsonHasAllKeys(self, node: JsonHasAllKeys) -> Q:
+    def visit_JsonHasAllKeys(self, node: nodes.JsonHasAllKeys) -> Q:
         return Q(**{f"{self.visit(node.left)}__has_keys": literal_value(node.keys)})
 
-    def visit_OrderBy(self, node: OrderBy) -> str:
+    def visit_OrderBy(self, node: nodes.OrderBy) -> str:
         field = self.visit(node.expression)
         return f"-{field}" if node.desc else field
 
-    def expression_for_annotation(self, node: Expr):
-        if isinstance(node, Column):
+    def expression_for_annotation(self, node: nodes.Expr):
+        if isinstance(node, nodes.Column):
             # Invariant (enforced by validation): a LATERAL SRF reference only
             # reaches codegen inside an aggregate, handled by aggregate_for_queryset.
             if node.annotations.get("is_lateral_ref") and node.name in self.lateral_fn_sources:
@@ -812,7 +799,7 @@ class CodegenVisitor(Visitor):
             if path == "*":
                 return F("pk")
             return F(path)
-        if isinstance(node, JsonPath):
+        if isinstance(node, nodes.JsonPath):
             if node.annotations.get("is_lateral_path"):
                 raise RuntimeError("Unexpected LATERAL element access in a non-aggregate expression")
             base_path = node.base.annotations["django_path"]
@@ -824,15 +811,15 @@ class CodegenVisitor(Visitor):
                 else:
                     expr = KeyTransform(str(key), expr)
             return expr
-        if isinstance(node, Literal):
+        if isinstance(node, nodes.Literal):
             return Value(node.value)
-        if isinstance(node, NullLiteral):
+        if isinstance(node, nodes.NullLiteral):
             return Value(None)
-        if isinstance(node, BooleanLiteral):
+        if isinstance(node, nodes.BooleanLiteral):
             return Value(node.value)
-        if isinstance(node, CastExpr):
+        if isinstance(node, nodes.CastExpr):
             return F(self.visit_CastExpr(node))
-        if isinstance(node, ArithmeticOp):
+        if isinstance(node, nodes.ArithmeticOp):
             left = self.expression_for_annotation(node.left)
             right = self.expression_for_annotation(node.right)
             if node.op == "+":
@@ -845,14 +832,14 @@ class CodegenVisitor(Visitor):
                 return left / right
             if node.op == "%":
                 return left % right
-        if isinstance(node, FunctionCall):
+        if isinstance(node, nodes.FunctionCall):
             name = node.name.lower()
             function = FUNCTION_TO_DJANGO[name]
             args = [self.expression_for_annotation(arg) for arg in node.args]
             if name in TEXT_FUNCTIONS:
                 return function(*args, output_field=CharField())
             return function(*args)
-        if isinstance(node, CaseExpr):
+        if isinstance(node, nodes.CaseExpr):
             whens = [
                 When(self.visit(condition), then=self.expression_for_annotation(result))
                 for condition, result in node.whens
@@ -861,7 +848,7 @@ class CodegenVisitor(Visitor):
             if node.default is not None:
                 kwargs["default"] = self.expression_for_annotation(node.default)
             return Case(*whens, **kwargs)
-        if isinstance(node, Alias):
+        if isinstance(node, nodes.Alias):
             return self.expression_for_annotation(node.expression)
         # Internal invariant: expression shapes reaching codegen are constrained
         # by the parser and rejected earlier by validation if unsupported.
