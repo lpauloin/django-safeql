@@ -1,3 +1,5 @@
+from django.core.exceptions import FieldDoesNotExist
+
 from django_safeql import nodes
 from django_safeql.casts import normalize_cast_type
 from django_safeql.json_schema import json_schema_type, JsonSchemaResolver
@@ -154,7 +156,19 @@ class AnnotationVisitor(Visitor):
         select_aliases = self.scope.mutate_mapping("select_aliases")
         select_aliases[node.alias] = node.expression
         node.annotations["alias"] = node.alias
+        # An alias in the main query becomes a queryset annotation; Django rejects
+        # one that collides with a real field of the base model. Record it so the
+        # validation layer can reject it cleanly instead of leaking a ValueError.
+        if not self.scope.get("is_lateral_subquery"):
+            node.annotations["alias_conflicts_with_field"] = self._is_model_field(self.schema.base_model, node.alias)
         return node
+
+    def _is_model_field(self, model, name) -> bool:
+        try:
+            model._meta.get_field(name)
+            return True
+        except FieldDoesNotExist:
+            return False
 
     def visit_Column(self, node: nodes.Column):
         if node.name == "*":

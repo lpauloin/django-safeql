@@ -148,6 +148,12 @@ class ValidationVisitor(Visitor):
             raise ValidationError(f"Unknown field: {node.annotations['sql_table']}.{node.name}")
         return node
 
+    def visit_Alias(self, node: Alias):
+        if node.annotations.get("alias_conflicts_with_field"):
+            raise ValidationError(f"Alias {node.alias!r} conflicts with a field of the base model")
+        self.visit(node.expression)
+        return node
+
     def visit_CastExpr(self, node: CastExpr):
         if node.annotations.get("cast_type") is None:
             raise ValidationError(f"Unsupported cast type: {node.target_type}")

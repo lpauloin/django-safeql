@@ -51,3 +51,10 @@ def test_rejects_excessive_limit(transpiler):
 def test_rejects_unsupported_cast_type(transpiler):
     with pytest.raises(ValidationError, match="Unsupported cast type"):
         transpiler.to_ast("SELECT book.pages::geometry AS g FROM book")
+
+
+def test_rejects_alias_that_collides_with_a_model_field(transpiler):
+    # Aliasing to a real field name would make Django raise a raw ValueError; it must
+    # surface as a clean ValidationError instead.
+    with pytest.raises(ValidationError, match="conflicts with a field"):
+        transpiler.to_ast("SELECT LOWER(book.title) AS status FROM book")

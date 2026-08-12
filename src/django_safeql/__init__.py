@@ -14,7 +14,7 @@ from django_safeql.schemas import JsonFieldSchema, SQLTranspilerSchema, TableSch
 from django_safeql.transpiler import SQLToQuerySetTranspiler
 from django_safeql.utils import pretty_print_sql
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "SQLToQuerySetTranspiler",

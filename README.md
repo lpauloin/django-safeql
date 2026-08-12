@@ -1,3 +1,15 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="django-safeql — run untrusted or AI-generated SQL safely" width="840">
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/django-safeql/"><img src="https://img.shields.io/pypi/v/django-safeql" alt="PyPI"></a>
+  <a href="https://github.com/lpauloin/django-safeql/actions/workflows/ci.yml"><img src="https://github.com/lpauloin/django-safeql/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python">
+  <img src="https://img.shields.io/badge/django-4.2%2B-092E20" alt="Django">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+</p>
+
 # django-safeql
 
 A whitelisted SQL-to-QuerySet transpiler for Django.
@@ -81,7 +93,7 @@ database:
 
 ```python
 transpiler.to_queryset("SELECT * FROM pg_catalog.pg_user")
-# django_safeql.ValidationError: Unknown table: pg_catalog
+# django_safeql.ValidationError: Unknown table: pg_user
 
 transpiler.to_queryset("DELETE FROM book WHERE id = 1")
 # django_safeql.UnsupportedSQL: ...
@@ -116,6 +128,10 @@ transpiler.to_queryset("DELETE FROM book WHERE id = 1")
 
 Anything not explicitly listed — DDL, writes, arbitrary functions, joins to
 undeclared tables — is rejected.
+
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md)
 
 ## License
 

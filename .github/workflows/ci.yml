@@ -38,6 +38,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install ".[dev]" "django==${{ matrix.django-version }}"
-      - run: PYTHONPATH=src:. pytest -n auto
+      - run: pytest -n auto
       - run: black --check src/ tests/
       - run: flake8 src/ tests/
+      - run: python -m build
+      - run: twine check dist/*
