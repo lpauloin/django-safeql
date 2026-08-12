@@ -13,6 +13,7 @@ from django_safeql.nodes import (
     ArithmeticOp,
     BinaryOp,
     CaseExpr,
+    Column,
     ExistsExpr,
     FunctionCall,
     JsonContains,
@@ -80,18 +81,6 @@ def _select_has_aggregate(select: Select | None) -> bool:
     return False
 
 
-def _select_has_non_aggregate(select: Select | None) -> bool:
-    if not select:
-        return False
-    for expr in select.columns:
-        if isinstance(expr, Aggregate):
-            continue
-        if isinstance(expr, Alias) and isinstance(expr.expression, Aggregate):
-            continue
-        return True
-    return False
-
-
 class ValidationVisitor(Visitor):
 
     def __init__(self, schema: SQLTranspilerSchema):
@@ -109,9 +98,118 @@ class ValidationVisitor(Visitor):
             raise ValidationError("HAVING requires GROUP BY")
         if node.limit is not None and self.schema.max_limit is not None and node.limit > self.schema.max_limit:
             raise ValidationError(f"LIMIT exceeds maximum allowed value: {self.schema.max_limit}")
-        if not node.group_by and _select_has_aggregate(node.select) and _select_has_non_aggregate(node.select):
-            raise ValidationError("Cannot mix aggregate and non-aggregate expressions in SELECT without GROUP BY")
-        return self.generic_visit(node)
+        # Validate every sub-node first (surfaces field/table/operator errors and
+        # resolves column annotations), then enforce GROUP BY coverage on top.
+        self.generic_visit(node)
+        self._check_aggregation(node)
+        return node
+
+    # -- GROUP BY / aggregation coverage -----------------------------------
+    #
+    # SQL-standard rule: in an aggregated query (one with a GROUP BY, or with an
+    # aggregate anywhere in SELECT), every non-aggregate expression in SELECT,
+    # HAVING and ORDER BY must be "covered" by the GROUP BY — it is one of the
+    # GROUP BY expressions, or every column leaf it references (outside of an
+    # aggregate) appears in the GROUP BY. Anything else is rejected here instead
+    # of being silently reinterpreted downstream (dropped column, HAVING folded
+    # into WHERE, or the GROUP BY silently widened).
+
+    def _check_aggregation(self, node: Query):
+        if not (node.group_by or _select_has_aggregate(node.select)):
+            return
+        aliases = node.annotations.get("select_aliases") or {}
+        grouped_keys, grouped_leaves = self._grouping_sets(node, aliases)
+
+        for item in node.select.columns if node.select else []:
+            expr = item.expression if isinstance(item, Alias) else item
+            if not self._covered(expr, grouped_keys, grouped_leaves, aliases):
+                label = self._ungrouped_label(expr, grouped_leaves, aliases)
+                raise ValidationError(
+                    f"Column {label!r} must appear in GROUP BY or be used in an aggregate function"
+                    if label
+                    else "SELECT expression must appear in GROUP BY or be used in an aggregate function"
+                )
+
+        if node.having is not None and not self._covered(node.having, grouped_keys, grouped_leaves, aliases):
+            raise ValidationError("HAVING may only reference aggregates or GROUP BY expressions")
+
+        for order in node.order_by:
+            if not self._covered(order.expression, grouped_keys, grouped_leaves, aliases):
+                raise ValidationError(
+                    "ORDER BY may only reference aggregates or GROUP BY expressions in an aggregated query"
+                )
+
+    def _grouping_sets(self, node: Query, aliases: dict):
+        grouped_keys: set = set()
+        grouped_leaves: set = set()
+        for group_expr in node.group_by:
+            grouped_keys.add(self._expr_key(group_expr, aliases))
+            resolved = self._resolve_alias(group_expr, aliases)
+            if isinstance(resolved, Column) and resolved.name != "*":
+                grouped_leaves.add(self._column_key(resolved))
+        return grouped_keys, grouped_leaves
+
+    def _covered(self, expr, grouped_keys: set, grouped_leaves: set, aliases: dict) -> bool:
+        if self._expr_key(expr, aliases) in grouped_keys:
+            return True
+        return all(leaf in grouped_leaves for leaf in self._leaves(expr, aliases))
+
+    def _resolve_alias(self, expr, aliases: dict, _seen=None):
+        """Resolve a column that references a SELECT alias to the aliased expression."""
+        if _seen is None:
+            _seen = set()
+        if isinstance(expr, Alias):
+            return self._resolve_alias(expr.expression, aliases, _seen)
+        if isinstance(expr, Column) and expr.annotations.get("select_alias"):
+            name = expr.annotations["select_alias"]
+            target = aliases.get(name)
+            if target is not None and id(target) not in _seen:
+                _seen.add(id(target))
+                return self._resolve_alias(target, aliases, _seen)
+        return expr
+
+    def _column_key(self, col: Column):
+        django_path = col.annotations.get("django_path")
+        if django_path:
+            return ("col", django_path)
+        return ("col", col.table, col.name)
+
+    def _expr_key(self, expr, aliases: dict):
+        expr = self._resolve_alias(expr, aliases)
+        if isinstance(expr, Column):
+            return self._column_key(expr)
+        if isinstance(expr, Aggregate):
+            inner = self._expr_key(expr.expression, aliases) if expr.expression else None
+            return ("agg", expr.function.lower(), bool(expr.distinct), inner)
+        parts = [type(expr).__name__]
+        for attr in ("op", "name", "target_type", "value", "returns_text"):
+            if hasattr(expr, attr):
+                parts.append((attr, getattr(expr, attr)))
+        if isinstance(expr, JsonPath):
+            parts.append(("path", tuple(expr.path)))
+        parts.append(tuple(self._expr_key(child, aliases) for child in expr.children()))
+        return tuple(parts)
+
+    def _leaves(self, expr, aliases: dict):
+        """Yield column keys for columns referenced outside of any aggregate.
+
+        A bare ``*`` column counts as an ungroupable leaf, so ``SELECT *`` is
+        rejected in an aggregated query.
+        """
+        expr = self._resolve_alias(expr, aliases)
+        if isinstance(expr, Aggregate):
+            return
+        if isinstance(expr, Column):
+            yield self._column_key(expr)
+            return
+        for child in expr.children():
+            yield from self._leaves(child, aliases)
+
+    def _ungrouped_label(self, expr, grouped_leaves: set, aliases: dict):
+        for leaf in self._leaves(expr, aliases):
+            if leaf not in grouped_leaves:
+                return leaf[1] if len(leaf) == 2 else ".".join(p for p in leaf[1:] if p)
+        return None
 
     def visit_BinaryOp(self, node: BinaryOp):
         if node.op not in SUPPORTED_OPS:

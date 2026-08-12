@@ -462,6 +462,46 @@ class SQLCodegenAggregateTestCase(SQLCodegenBaseTestCase):
         # d1, d2, d4 are PUBLISHED; d3 is REJECTED.
         self.assertEqual(counts, {"PUBLISHED": 3, "REJECTED": 1})
 
+    def test_expression_over_grouped_column(self):
+        # LOWER(status) is covered because its only column leaf (status) is grouped.
+        qs = self.transpiler.to_queryset("""
+            SELECT LOWER(book.status) AS s, COUNT(*) AS cnt
+            FROM book
+            GROUP BY book.status
+        """)
+        counts = {row["s"]: row["cnt"] for row in qs}
+        self.assertEqual(counts, {"published": 3, "rejected": 1})
+
+    def test_having_on_grouped_column(self):
+        qs = self.transpiler.to_queryset("""
+            SELECT book.status, COUNT(*) AS c
+            FROM book
+            GROUP BY book.status
+            HAVING book.status = 'PUBLISHED'
+        """)
+        counts = {row["status"]: row["c"] for row in qs}
+        self.assertEqual(counts, {"PUBLISHED": 3})
+
+    def test_order_by_grouped_column(self):
+        qs = self.transpiler.to_queryset("""
+            SELECT book.status, COUNT(*) AS c
+            FROM book
+            GROUP BY book.status
+            ORDER BY book.status ASC
+        """)
+        self.assertEqual([row["status"] for row in qs], ["PUBLISHED", "REJECTED"])
+
+    def test_multi_column_group_by(self):
+        qs = self.transpiler.to_queryset("""
+            SELECT book.author_id, book.status, COUNT(*) AS c
+            FROM book
+            GROUP BY book.author_id, book.status
+        """)
+        buckets = {(row["author_id"], row["status"]): row["c"] for row in qs}
+        self.assertEqual(buckets[(self.author_x.id, "PUBLISHED")], 2)
+        self.assertEqual(buckets[(self.author_y.id, "REJECTED")], 1)
+        self.assertEqual(buckets[(self.author_z.id, "PUBLISHED")], 1)
+
 
 # ---------------------------------------------------------------------------
 # 7. Collection aggregates — ARRAY_AGG, STRING_AGG, JSON_AGG, etc.
