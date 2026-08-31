@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 from django.db.models import QuerySet
 

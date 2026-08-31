@@ -64,6 +64,30 @@ STRING_FUNCTIONS = frozenset(
         "replace",
         "strpos",
         "position",  # position is an alias for strpos
+        "left",
+        "right",
+        "repeat",
+        "reverse",
+        "lpad",
+        "rpad",
+    ]
+)
+
+# ---------------------------------------------------------------------------
+# Functions — math
+# ---------------------------------------------------------------------------
+
+MATH_FUNCTIONS = frozenset(
+    [
+        "abs",
+        "ceil",
+        "floor",
+        "sqrt",
+        "sign",
+        "exp",
+        "ln",
+        "round",
+        "power",
     ]
 )
 
@@ -113,7 +137,67 @@ SUPPORTED_SRF_FUNCTIONS = frozenset({"jsonb_array_elements", "jsonb_array_elemen
 # Combined
 # ---------------------------------------------------------------------------
 
-SUPPORTED_FUNCTIONS = STRING_FUNCTIONS | DATE_FUNCTIONS | JSON_FUNCTIONS
+SUPPORTED_FUNCTIONS = STRING_FUNCTIONS | MATH_FUNCTIONS | DATE_FUNCTIONS | JSON_FUNCTIONS
+
+# JSON scalar functions that are translated to every backend (so they are not gated;
+# the per-target capability keys live on the Feature class in targets.py).
+PORTABLE_JSON_FUNCTIONS = frozenset({"jsonb_array_length"})
+
+# ---------------------------------------------------------------------------
+# Dialect
+# ---------------------------------------------------------------------------
+
+
+class DialectOp:
+    """Keys into a target's `dialect` dict (see targets.py).
+
+    Each key maps to a SQL template with `{expr}` / `{key}` / `{value}` / `{ordering}`
+    placeholders that the codegen fills; `%s` markers stay for bound parameters. Keeping
+    the SQL text in the per-target dialect means no raw SQL keyword or function name is
+    written inline in codegen.
+    """
+
+    ILIKE = "ilike"
+    STRING_AGG = "string_agg"
+    # ARRAY_AGG is emulated as a JSON array on the non-Postgres targets (Postgres keeps its
+    # native array via contrib.postgres, so it has no ARRAY_AGG template).
+    ARRAY_AGG = "array_agg"
+    JSON_AGG = "json_agg"
+    JSONB_AGG = "jsonb_agg"
+    JSON_OBJECT_AGG = "json_object_agg"
+    JSONB_OBJECT_AGG = "jsonb_object_agg"
+    JSON_ARRAY_LENGTH = "json_array_length"
+    # LATERAL set-returning function → the FROM clause that iterates the array (`{fn}` is
+    # the SRF name, `{source}` the array expression), the element reference used in the
+    # aggregate, and the cast wrapper (`{expr}`, `{type}`).
+    LATERAL_TABLE = "lateral_table"
+    LATERAL_ELEMENT = "lateral_element"
+    CAST = "cast"
+
+
+class CastType:
+    """Canonical cast target types.
+
+    `normalize_cast_type` maps SQL type names to these; a target's `cast_types` dict maps
+    them to the concrete type name emitted in a raw cast (see targets.py). The main cast
+    path uses Django's portable `Cast`; only the LATERAL SRF emits raw cast SQL.
+    """
+
+    INTEGER = "integer"
+    FLOAT = "float"
+    DECIMAL = "decimal"
+    BOOLEAN = "boolean"
+    DATE = "date"
+    DATETIME = "datetime"
+    STRING = "string"
+    JSON = "json"
+
+
+# LIKE is standard SQL on every backend, so it is not part of the per-target dialect.
+SQL_LIKE_TEMPLATE = "({expr}) LIKE %s"
+
+# JSON extract-scalar operator (`->>`), shared by every backend.
+SQL_EXTRACT_TEXT_OP = "->>"
 
 # ---------------------------------------------------------------------------
 # AST node types

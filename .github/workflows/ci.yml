@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 jobs:
@@ -27,6 +27,7 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
         django-version: ["4.2.*", "5.2.*"]
     env:
+      DJANGO_SAFEQL_TEST_BACKEND: postgresql
       DJANGO_SAFEQL_TEST_DB: django_safeql
       DJANGO_SAFEQL_TEST_DB_USER: postgres
       DJANGO_SAFEQL_TEST_DB_PASSWORD: postgres
@@ -37,9 +38,67 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install ".[dev]" "django==${{ matrix.django-version }}"
+      - uses: astral-sh/setup-uv@v5
+      - run: uv lock --check
+      - run: uv pip install --system ".[dev]" "django==${{ matrix.django-version }}"
       - run: pytest -n auto
-      - run: black --check src/ tests/
-      - run: flake8 src/ tests/
-      - run: python -m build
+      - run: ruff check src/ tests/
+      - run: ruff format --check src/ tests/
+      - run: uv build
       - run: twine check dist/*
+
+  # SQLite needs no service. Portable queries run and verify; features SQLite does not
+  # support are auto-skipped by the target-capability check (see tests/conftest.py).
+  test-sqlite:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        django-version: ["4.2.*", "5.2.*"]
+    env:
+      DJANGO_SAFEQL_TEST_BACKEND: sqlite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
+      - run: uv pip install --system ".[dev]" "django==${{ matrix.django-version }}"
+      - run: pytest -n auto
+
+  # MySQL runs the same portable subset; unsupported features auto-skip. The pure-Python
+  # pymysql driver (in the dev extras) is used via the shim in tests/settings.py.
+  test-mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: django_safeql
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        django-version: ["4.2.*", "5.2.*"]
+    env:
+      DJANGO_SAFEQL_TEST_BACKEND: mysql
+      DJANGO_SAFEQL_TEST_DB: django_safeql
+      DJANGO_SAFEQL_TEST_DB_USER: root
+      DJANGO_SAFEQL_TEST_DB_PASSWORD: root
+      DJANGO_SAFEQL_TEST_DB_HOST: 127.0.0.1
+      DJANGO_SAFEQL_TEST_DB_PORT: 3306
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
+      - run: uv pip install --system ".[dev]" "django==${{ matrix.django-version }}"
+      - run: pytest -n auto

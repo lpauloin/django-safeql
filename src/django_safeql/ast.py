@@ -62,7 +62,6 @@ MAX_SQL_LENGTH = 100_000
 
 
 class SQLGlotParser:
-
     def parse(self, sql: str) -> Query:
         if len(sql) > MAX_SQL_LENGTH:
             raise UnsupportedSQL(f"SQL exceeds the maximum supported length of {MAX_SQL_LENGTH} characters")
@@ -343,6 +342,35 @@ class SQLGlotParser:
 
     def visit_StrPosition(self, node: exp.StrPosition) -> FunctionCall:
         return FunctionCall(name="strpos", args=[self.visit(node.this), self.visit(node.args["substr"])])
+
+    # SQLGlot parses these multi-argument functions into dedicated node types whose extra
+    # arguments live in named slots (not `expressions`), so each needs an explicit visitor
+    # to keep every argument.
+
+    def visit_Round(self, node: exp.Round) -> FunctionCall:
+        args = [self.visit(node.this)]
+        if node.args.get("decimals") is not None:
+            args.append(self.visit(node.args["decimals"]))
+        return FunctionCall(name="round", args=args)
+
+    def visit_Pow(self, node: exp.Pow) -> FunctionCall:
+        return FunctionCall(name="power", args=[self.visit(node.this), self.visit(node.args["expression"])])
+
+    def visit_Left(self, node: exp.Left) -> FunctionCall:
+        return FunctionCall(name="left", args=[self.visit(node.this), self.visit(node.args["expression"])])
+
+    def visit_Right(self, node: exp.Right) -> FunctionCall:
+        return FunctionCall(name="right", args=[self.visit(node.this), self.visit(node.args["expression"])])
+
+    def visit_Repeat(self, node: exp.Repeat) -> FunctionCall:
+        return FunctionCall(name="repeat", args=[self.visit(node.this), self.visit(node.args["times"])])
+
+    def visit_Pad(self, node: exp.Pad) -> FunctionCall:
+        name = "lpad" if node.args.get("is_left") else "rpad"
+        args = [self.visit(node.this), self.visit(node.args["expression"])]
+        if node.args.get("fill_pattern") is not None:
+            args.append(self.visit(node.args["fill_pattern"]))
+        return FunctionCall(name=name, args=args)
 
     def visit_Anonymous(self, node: exp.Anonymous) -> FunctionCall:
         name = node.name.lower()

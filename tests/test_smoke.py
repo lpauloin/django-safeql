@@ -1,4 +1,5 @@
 import pytest
+from django.db import connection
 
 from django_safeql import SQLToQuerySetTranspiler, UnsupportedSQL, ValidationError
 from tests.schema_factory import make_codegen_schema
@@ -29,7 +30,7 @@ def catalog(db):
         price="4.50",
         details={"language": "fr", "edition": 2},
     )
-    return SQLToQuerySetTranspiler(make_codegen_schema())
+    return SQLToQuerySetTranspiler(make_codegen_schema(), target=connection.vendor)
 
 
 def test_select_where_orders_and_limits(catalog):

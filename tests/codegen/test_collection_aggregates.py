@@ -1,4 +1,7 @@
+import sqlite3
+
 import pytest
+from django.db import connection
 
 from django_safeql.exceptions import ValidationError
 
@@ -32,6 +35,8 @@ def test_array_agg_with_group_by(library):
 
 
 def test_array_agg_order_by(library):
+    if connection.vendor == "sqlite" and sqlite3.sqlite_version_info < (3, 44):
+        pytest.skip("json_group_array(... ORDER BY ...) requires SQLite 3.44+")
     qs = library.transpiler.to_queryset("""
         SELECT ARRAY_AGG(book.title ORDER BY book.title ASC) AS names
         FROM book

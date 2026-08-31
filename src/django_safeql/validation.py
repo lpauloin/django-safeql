@@ -1,6 +1,8 @@
 from django_safeql.constants import (
     ALLOWED_NODE_TYPES,
     COLLECTION_AGGREGATES,
+    JSON_FUNCTIONS,
+    PORTABLE_JSON_FUNCTIONS,
     SCALAR_AGGREGATES,
     SUPPORTED_AGGREGATES,
     SUPPORTED_ARITHMETIC_OPS,
@@ -32,6 +34,7 @@ from django_safeql.nodes import (
     Select,
 )
 from django_safeql.schemas import SQLTranspilerSchema
+from django_safeql.targets import Feature, Vendor
 from django_safeql.visitor import Visitor
 
 # None = any arity; int = exact; tuple = (min, max) where max=None means unbounded
@@ -49,6 +52,21 @@ FUNCTION_ARITY = {
     "replace": 3,
     "strpos": 2,
     "position": 2,
+    "left": 2,
+    "right": 2,
+    "repeat": 2,
+    "reverse": 1,
+    "lpad": (2, 3),
+    "rpad": (2, 3),
+    "abs": 1,
+    "ceil": 1,
+    "floor": 1,
+    "sqrt": 1,
+    "sign": 1,
+    "exp": 1,
+    "ln": 1,
+    "round": (1, 2),
+    "power": 2,
     "now": 0,
     "jsonb_array_length": 1,
     "jsonb_typeof": 1,
@@ -87,9 +105,9 @@ def _select_has_aggregate(select: Select | None) -> bool:
 
 
 class ValidationVisitor(Visitor):
-
-    def __init__(self, schema: SQLTranspilerSchema):
+    def __init__(self, schema: SQLTranspilerSchema, target):
         self.schema = schema
+        self.target = target
 
     def visit_Query(self, node: Query):
         self._check_node_types(node)
@@ -253,6 +271,8 @@ class ValidationVisitor(Visitor):
         return node
 
     def visit_JsonContains(self, node: JsonContains):
+        if not self.target.supports(Feature.JSON_CONTAINS):
+            raise ValidationError(f"JSON contains @> is not supported on the {self.target.name} target")
         self.visit(node.left)
         value = literal_value(node.value)
         if not isinstance(value, (dict, list)):
@@ -280,9 +300,21 @@ class ValidationVisitor(Visitor):
         return node
 
     def visit_Aggregate(self, node: Aggregate):
-        if node.function.lower() not in SUPPORTED_AGGREGATES:
+        function = node.function.lower()
+        if function not in SUPPORTED_AGGREGATES:
             raise ValidationError(f"Unsupported aggregate: {node.function}")
-        if node.annotations.get("wraps_srf") and node.function.lower() in COLLECTION_AGGREGATES:
+        non_postgres = self.target.vendor != Vendor.POSTGRESQL
+        # ARRAY_AGG is emulated as a JSON array off Postgres. DISTINCT and an inner ORDER BY
+        # are carried only where the JSON aggregate supports them (not MySQL), so reject
+        # them elsewhere rather than silently drop them and return a wrong result.
+        if function == "array_agg":
+            if (node.distinct or node.order_by) and not self.target.supports(Feature.ARRAY_AGG_MODIFIERS):
+                raise ValidationError(
+                    f"ARRAY_AGG with DISTINCT or ORDER BY is not supported on the {self.target.name} target"
+                )
+        elif function in COLLECTION_AGGREGATES and node.order_by and non_postgres:
+            raise ValidationError(f"ORDER BY inside an aggregate is not supported on the {self.target.name} target")
+        if node.annotations.get("wraps_srf") and function in COLLECTION_AGGREGATES:
             raise ValidationError(
                 f"{node.function.upper()} is not supported over LATERAL set-returning functions; "
                 "use SUM, COUNT, AVG, MIN or MAX instead"
@@ -305,6 +337,10 @@ class ValidationVisitor(Visitor):
         name = node.name.lower()
         if name not in SUPPORTED_FUNCTIONS:
             raise ValidationError(f"Unsupported SQL function: {node.name}")
+        if name in JSON_FUNCTIONS and name not in PORTABLE_JSON_FUNCTIONS:
+            feature = Feature.JSONPATH if name.startswith("jsonb_path_") else Feature.JSONB_SCALAR_FUNCTIONS
+            if not self.target.supports(feature):
+                raise ValidationError(f"{node.name}() is not supported on the {self.target.name} target")
         _check_arity(name, len(node.args), FUNCTION_ARITY.get(name))
         for arg in node.args:
             self.visit(arg)
@@ -321,6 +357,10 @@ class ValidationVisitor(Visitor):
 
     def visit_LateralJoin(self, node: LateralJoin):
         if node.fn_call:
+            if not self.target.supports(Feature.LATERAL_SRF):
+                raise ValidationError(
+                    f"LATERAL set-returning functions are not supported on the {self.target.name} target"
+                )
             fn_name = node.fn_call.name.lower()
             if fn_name not in SUPPORTED_SRF_FUNCTIONS:
                 raise ValidationError(

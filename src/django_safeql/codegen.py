@@ -1,9 +1,9 @@
 import re
 
-from django.contrib.postgres.aggregates import ArrayAgg as DjangoArrayAgg
-from django.contrib.postgres.aggregates import StringAgg as DjangoStringAgg
 from django.db.models import (
     Aggregate as DjangoAggregate,
+)
+from django.db.models import (
     Avg,
     BooleanField,
     Case,
@@ -12,14 +12,12 @@ from django.db.models import (
     DateField,
     DateTimeField,
     DecimalField,
-    Exists as DjangoExists,
     F,
     FloatField,
     IntegerField,
     JSONField,
     Max,
     Min,
-    OrderBy as DjangoOrderBy,
     OuterRef,
     Q,
     QuerySet,
@@ -28,12 +26,21 @@ from django.db.models import (
     Value,
     When,
 )
+from django.db.models import (
+    Exists as DjangoExists,
+)
+from django.db.models import (
+    OrderBy as DjangoOrderBy,
+)
 from django.db.models.expressions import Func
 from django.db.models.fields.json import KeyTextTransform, KeyTransform
 from django.db.models.functions import (
+    Abs,
     Cast,
+    Ceil,
     Coalesce,
     Concat,
+    Exp,
     ExtractDay,
     ExtractHour,
     ExtractMinute,
@@ -42,12 +49,24 @@ from django.db.models.functions import (
     ExtractSecond,
     ExtractWeek,
     ExtractYear,
+    Floor,
+    Left,
     Length,
+    Ln,
     Lower,
+    LPad,
     LTrim,
     Now,
+    Power,
+    Repeat,
     Replace,
+    Reverse,
+    Right,
+    Round,
+    RPad,
     RTrim,
+    Sign,
+    Sqrt,
     StrIndex,
     Substr,
     Trim,
@@ -61,7 +80,8 @@ from django.db.models.functions import (
 )
 
 from django_safeql import nodes
-from django_safeql.casts import normalize_cast_type, postgres_cast_type
+from django_safeql.casts import normalize_cast_type
+from django_safeql.constants import SQL_EXTRACT_TEXT_OP, SQL_LIKE_TEMPLATE, CastType, DialectOp
 from django_safeql.literals import literal_value
 from django_safeql.visitor import Visitor
 
@@ -77,49 +97,56 @@ OP_TO_LOOKUP = {
 
 
 class LikeExpr(Func):
-    """Emit a raw LIKE or ILIKE expression, preserving % wildcards exactly as written."""
+    """Emit a LIKE/ILIKE match from a per-target `{expr}` template, preserving % wildcards.
 
-    def __init__(self, field_expr, pattern, case_insensitive=False, **kwargs):
+    The template comes from the target dialect (ILIKE) or the shared LIKE template, so the
+    Postgres `ILIKE` keyword and the sqlite/mysql `LOWER() LIKE LOWER()` rewrite are just
+    different templates rather than branches here.
+    """
+
+    def __init__(self, field_expr, pattern, template, **kwargs):
         self._pattern = pattern
-        self._op = "ILIKE" if case_insensitive else "LIKE"
+        self._template = template
         kwargs.setdefault("output_field", BooleanField())
         super().__init__(field_expr, **kwargs)
 
     def as_sql(self, compiler, connection, **extra_context):
         sql, params = compiler.compile(self.source_expressions[0])
-        return f"({sql}) {self._op} %s", params + [self._pattern]
+        return self._template.format(expr=sql), list(params) + [self._pattern]
 
 
 class JsonbArrayAggFunc(Func):
-    """Aggregate over elements of a JSONB array via a correlated scalar subquery.
+    """Aggregate over the elements of a JSON array via a correlated scalar subquery.
 
-    Generates: (SELECT AGG((elem->>'key')::cast) FROM fn_name(source) AS elem)
+    The array-iteration table (`jsonb_array_elements` / `json_each`), the element
+    reference (`elem` / `value`) and the cast wrapper all come from the target dialect,
+    so the same shape covers PostgreSQL and SQLite.
     """
 
-    def __init__(self, source, fn_name, agg_fn, element_key=None, cast_type=None, **kwargs):
+    def __init__(self, source, fn_name, agg_fn, dialect, cast_types, element_key=None, cast_type=None, **kwargs):
         self._fn_name = fn_name
         self._agg_fn = agg_fn.upper()
         self._element_key = element_key
         self._cast_type = cast_type
+        self._dialect = dialect
+        self._cast_types = cast_types
         super().__init__(source, **kwargs)
 
     def as_sql(self, compiler, connection, **extra_context):
         source_sql, params = compiler.compile(self.source_expressions[0])
-        cast = f"::{postgres_cast_type(self._cast_type)}" if self._cast_type else ""
+        element = self._dialect[DialectOp.LATERAL_ELEMENT]
         extra_params: list = []
-        if self._fn_name == "jsonb_array_elements_text":
-            val = f"elem{cast}"
-        elif self._element_key:
+        if self._element_key and self._fn_name != "jsonb_array_elements_text":
             # element_key comes from the query text (JSON path segment) and must never be
             # interpolated into the SQL string — bind it as a parameter instead.
-            val = f"(elem->>%s){cast}"
+            value = f"{element}{SQL_EXTRACT_TEXT_OP}%s"
             extra_params = [self._element_key]
         else:
-            val = f"elem{cast}"
-        return (
-            f"(SELECT {self._agg_fn}({val}) FROM {self._fn_name}({source_sql}) AS elem)",
-            extra_params + list(params),
-        )
+            value = element
+        if self._cast_type:
+            value = self._dialect[DialectOp.CAST].format(expr=value, type=self._cast_types[self._cast_type])
+        table = self._dialect[DialectOp.LATERAL_TABLE].format(fn=self._fn_name, source=source_sql)
+        return (f"(SELECT {self._agg_fn}({value}) FROM {table})", extra_params + list(params))
 
 
 class JsonpathFunc(Func):
@@ -137,7 +164,20 @@ class JsonpathFunc(Func):
         return f"{fn}({', '.join(sqls)})", params
 
 
-class _SafeJSONOutputField(JSONField):
+class JsonArrayLength(Func):
+    """Number of elements in a JSON array; the function name comes from the target dialect."""
+
+    def __init__(self, expression, template, **kwargs):
+        self._template = template
+        kwargs.setdefault("output_field", IntegerField())
+        super().__init__(expression, **kwargs)
+
+    def as_sql(self, compiler, connection, **extra_context):
+        sql, params = compiler.compile(self.source_expressions[0])
+        return self._template.format(expr=sql), params
+
+
+class SafeJSONOutputField(JSONField):
     """JSON output field that handles both str and already-decoded Python values.
 
     Django's JSONField.from_db_value unconditionally calls json.loads(), but some
@@ -150,40 +190,74 @@ class _SafeJSONOutputField(JSONField):
         return super().from_db_value(value, expression, connection)
 
 
-class JsonAgg(DjangoAggregate):
-    function = "JSON_AGG"
-    name = "JsonAgg"
+# Collection aggregates. One class per operation, each rendering the SQL template the
+# builder read from the target's dialect — so there is no per-backend branching and no
+# raw SQL string in the codegen. PostgreSQL is not special: it is just another template.
 
-    def __init__(self, expression, **kwargs):
-        kwargs.setdefault("output_field", _SafeJSONOutputField())
+
+def render_inner_ordering(ordering, compiler):
+    """Compile an aggregate's inner ORDER BY to `" ORDER BY ..."` SQL plus its params.
+
+    The ordering expressions are stored unresolved, so resolve each against the query
+    (turning its F() references into real column references) before compiling.
+    """
+    if not ordering:
+        return "", []
+    parts, params = [], []
+    for order in ordering:
+        sql, order_params = compiler.compile(order.resolve_expression(compiler.query))
+        parts.append(sql)
+        params.extend(order_params)
+    return " ORDER BY " + ", ".join(parts), params
+
+
+class StringAggregate(DjangoAggregate):
+    name = "StringAggregate"
+
+    def __init__(self, expression, delimiter, template, ordering=(), **kwargs):
+        self._delimiter = delimiter
+        self._template = template
+        self._ordering = ordering
+        kwargs.setdefault("output_field", CharField())
         super().__init__(expression, **kwargs)
 
+    def as_sql(self, compiler, connection, **extra_context):
+        sql, params = compiler.compile(self.source_expressions[0])
+        order_sql, order_params = render_inner_ordering(self._ordering, compiler)
+        rendered = self._template.format(expr=sql, ordering=order_sql)
+        return rendered, list(params) + [self._delimiter] + order_params
 
-class JsonbAgg(DjangoAggregate):
-    function = "JSONB_AGG"
-    name = "JsonbAgg"
 
-    def __init__(self, expression, **kwargs):
-        kwargs.setdefault("output_field", JSONField())
+class JsonArrayAggregate(DjangoAggregate):
+    name = "JsonArrayAggregate"
+
+    def __init__(self, expression, template, distinct=False, ordering=(), **kwargs):
+        self._template = template
+        self._distinct = distinct
+        self._ordering = ordering
+        kwargs.setdefault("output_field", SafeJSONOutputField())
         super().__init__(expression, **kwargs)
 
+    def as_sql(self, compiler, connection, **extra_context):
+        sql, params = compiler.compile(self.source_expressions[0])
+        distinct = "DISTINCT " if self._distinct else ""
+        order_sql, order_params = render_inner_ordering(self._ordering, compiler)
+        rendered = self._template.format(expr=sql, distinct=distinct, ordering=order_sql)
+        return rendered, list(params) + order_params
 
-class JsonObjectAgg(DjangoAggregate):
-    function = "JSON_OBJECT_AGG"
-    name = "JsonObjectAgg"
 
-    def __init__(self, key_expr, value_expr, **kwargs):
-        kwargs.setdefault("output_field", _SafeJSONOutputField())
+class JsonObjectAggregate(DjangoAggregate):
+    name = "JsonObjectAggregate"
+
+    def __init__(self, key_expr, value_expr, template, **kwargs):
+        self._template = template
+        kwargs.setdefault("output_field", SafeJSONOutputField())
         super().__init__(key_expr, value_expr, **kwargs)
 
-
-class JsonbObjectAgg(DjangoAggregate):
-    function = "JSONB_OBJECT_AGG"
-    name = "JsonbObjectAgg"
-
-    def __init__(self, key_expr, value_expr, **kwargs):
-        kwargs.setdefault("output_field", JSONField())
-        super().__init__(key_expr, value_expr, **kwargs)
+    def as_sql(self, compiler, connection, **extra_context):
+        key_sql, key_params = compiler.compile(self.source_expressions[0])
+        value_sql, value_params = compiler.compile(self.source_expressions[1])
+        return self._template.format(key=key_sql, value=value_sql), list(key_params) + list(value_params)
 
 
 AGGREGATE_TO_DJANGO = {
@@ -208,6 +282,22 @@ FUNCTION_TO_DJANGO = {
     "replace": Replace,
     "strpos": StrIndex,
     "position": StrIndex,
+    "left": Left,
+    "right": Right,
+    "repeat": Repeat,
+    "reverse": Reverse,
+    "lpad": LPad,
+    "rpad": RPad,
+    # math
+    "abs": Abs,
+    "ceil": Ceil,
+    "floor": Floor,
+    "sqrt": Sqrt,
+    "sign": Sign,
+    "exp": Exp,
+    "ln": Ln,
+    "round": Round,
+    "power": Power,
     # date_trunc
     "trunc_year": TruncYear,
     "trunc_quarter": TruncQuarter,
@@ -227,7 +317,6 @@ FUNCTION_TO_DJANGO = {
     # CURRENT_DATE / CURRENT_TIMESTAMP → zero-arg lambda
     "now": lambda: Now(),
     # JSON — scalar read-only functions
-    "jsonb_array_length": lambda expr: Func(expr, function="JSONB_ARRAY_LENGTH", output_field=IntegerField()),
     "jsonb_typeof": lambda expr: Func(expr, function="JSONB_TYPEOF", output_field=CharField()),
     "jsonb_extract_path": lambda *args: Func(*args, function="JSONB_EXTRACT_PATH", output_field=JSONField()),
     "jsonb_extract_path_text": lambda *args: Func(*args, function="JSONB_EXTRACT_PATH_TEXT", output_field=CharField()),
@@ -260,8 +349,8 @@ class StaticRows:
 
 
 class CodegenVisitor(Visitor):
-
-    def __init__(self):
+    def __init__(self, target):
+        self.target = target
         self.annotate_kwargs: dict = {}
         self.annotation_counter: int = 0
         self.codegen_aliases: dict[str, str] = {}
@@ -416,11 +505,9 @@ class CodegenVisitor(Visitor):
     def _agg_output_field(self, function: str, cast_type: str | None = None):
         if function == "count":
             return IntegerField()
-        if cast_type == "integer":
+        if cast_type == CastType.INTEGER:
             return IntegerField()
-        if cast_type in ("decimal", "float"):
-            return DecimalField(max_digits=30, decimal_places=10)
-        if cast_type == "numeric":
+        if cast_type in (CastType.DECIMAL, CastType.FLOAT):
             return DecimalField(max_digits=30, decimal_places=10)
         return FloatField()
 
@@ -605,8 +692,9 @@ class CodegenVisitor(Visitor):
         if node.op in {"LIKE", "ILIKE"}:
             field_expr = self.expression_for_annotation(node.left)
             pattern = literal_value(node.right)
+            template = self.target.dialect[DialectOp.ILIKE] if node.op == "ILIKE" else SQL_LIKE_TEMPLATE
             alias = self.next_alias("like")
-            self.annotate_kwargs[alias] = LikeExpr(field_expr, pattern, case_insensitive=(node.op == "ILIKE"))
+            self.annotate_kwargs[alias] = LikeExpr(field_expr, pattern, template)
             return Q(**{alias: True})
         field = self.visit(node.left)
         if node.right.annotations.get("is_outer_ref"):
@@ -707,6 +795,8 @@ class CodegenVisitor(Visitor):
                     source_expr,
                     fn_name,
                     function,
+                    self.target.dialect,
+                    self.target.cast_types,
                     element_key=element_key,
                     cast_type=cast_type,
                     output_field=self._agg_output_field(function, cast_type),
@@ -723,10 +813,16 @@ class CodegenVisitor(Visitor):
         return tuple(parts)
 
     def _build_array_agg(self, node: nodes.Aggregate, source=None):
+        # No portable native array type, so ARRAY_AGG is emulated as a JSON array on every
+        # backend (decoded to a Python list, like psycopg gives for a real Postgres array).
+        # Validation rejects DISTINCT/ORDER BY on targets whose JSON aggregate cannot carry
+        # them (MySQL), so whatever reaches here is supported by the dialect template.
         if source is None:
             source = self.expression_for_annotation(node.expression)
         ordering = self._aggregate_order_by(node.order_by)
-        return DjangoArrayAgg(source, distinct=node.distinct, ordering=ordering)
+        return JsonArrayAggregate(
+            source, self.target.dialect[DialectOp.ARRAY_AGG], distinct=node.distinct, ordering=ordering
+        )
 
     def _build_string_agg(self, node: nodes.Aggregate, source=None):
         if source is None:
@@ -735,20 +831,20 @@ class CodegenVisitor(Visitor):
         if not isinstance(delimiter, str):
             delimiter = str(delimiter)
         ordering = self._aggregate_order_by(node.order_by)
-        return DjangoStringAgg(source, delimiter, ordering=ordering)
+        return StringAggregate(source, delimiter, self.target.dialect[DialectOp.STRING_AGG], ordering=ordering)
 
     def _build_json_agg(self, node: nodes.Aggregate, source=None):
         if source is None:
             source = self.expression_for_annotation(node.expression)
-        cls = JsonAgg if node.function.lower() == "json_agg" else JsonbAgg
-        return cls(source)
+        op = DialectOp.JSONB_AGG if node.function.lower() == "jsonb_agg" else DialectOp.JSON_AGG
+        return JsonArrayAggregate(source, self.target.dialect[op])
 
     def _build_json_object_agg(self, node: nodes.Aggregate, source=None):
-        cls = JsonObjectAgg if node.function.lower() == "json_object_agg" else JsonbObjectAgg
         if source is None:
             source = self.expression_for_annotation(node.expression)
         value = self.expression_for_annotation(node.extra_args[0]) if node.extra_args else Value(None)
-        return cls(source, value)
+        op = DialectOp.JSONB_OBJECT_AGG if node.function.lower() == "jsonb_object_agg" else DialectOp.JSON_OBJECT_AGG
+        return JsonObjectAggregate(source, value, self.target.dialect[op])
 
     def aggregate_source(self, node: nodes.Aggregate):
         if isinstance(node.expression, nodes.Column) and node.expression.name == "*":
@@ -818,9 +914,10 @@ class CodegenVisitor(Visitor):
             if node.op == "%":
                 return left % right
         if isinstance(node, nodes.FunctionCall):
-            function = FUNCTION_TO_DJANGO[node.name.lower()]
             args = [self.expression_for_annotation(arg) for arg in node.args]
-            return function(*args)
+            if node.name.lower() == "jsonb_array_length":
+                return JsonArrayLength(args[0], self.target.dialect[DialectOp.JSON_ARRAY_LENGTH])
+            return FUNCTION_TO_DJANGO[node.name.lower()](*args)
         if isinstance(node, nodes.CaseExpr):
             whens = [
                 When(self.visit(condition), then=self.expression_for_annotation(result))
@@ -841,21 +938,21 @@ class CodegenVisitor(Visitor):
 
 
 def django_output_field_for_cast(cast_type):
-    if cast_type == "integer":
+    if cast_type == CastType.INTEGER:
         return IntegerField()
-    if cast_type == "float":
+    if cast_type == CastType.FLOAT:
         return FloatField()
-    if cast_type == "decimal":
+    if cast_type == CastType.DECIMAL:
         return DecimalField(max_digits=30, decimal_places=10)
-    if cast_type == "boolean":
+    if cast_type == CastType.BOOLEAN:
         return BooleanField()
-    if cast_type == "date":
+    if cast_type == CastType.DATE:
         return DateField()
-    if cast_type == "datetime":
+    if cast_type == CastType.DATETIME:
         return DateTimeField()
-    if cast_type == "string":
+    if cast_type == CastType.STRING:
         return CharField()
-    if cast_type == "json":
+    if cast_type == CastType.JSON:
         return JSONField()
     # Internal invariant: cast_type has already been normalised and validated.
     raise RuntimeError(f"Unhandled cast type in codegen: {cast_type!r}")

@@ -1,6 +1,6 @@
 import pytest
 
-from tests.helpers import ids
+from tests.helpers import ids, requires_postgres
 from tests.testapp.models import Book
 
 
@@ -91,6 +91,7 @@ def test_jsonb_array_elements_sum_per_document(library):
     assert rows[library.d2.id] is None
 
 
+@requires_postgres
 def test_jsonb_array_elements_uses_correlated_subquery(library):
     qs = library.transpiler.to_queryset("""
         SELECT book.id, SUM((item->>'amount')::numeric) AS total_amount
@@ -115,6 +116,7 @@ def test_jsonb_array_elements_whole_table_aggregate(library):
     assert float(rows[0]["grand_total"] or 0) == pytest.approx(120.50, abs=0.01)
 
 
+@requires_postgres
 def test_jsonb_array_elements_element_key_is_bound_parameter(library):
     # The JSON key ('amount') must be a bound parameter, never interpolated.
     qs = library.transpiler.to_queryset("""
@@ -182,6 +184,7 @@ def test_lateral_inner_where_in_values(library):
     assert rows[library.d3.id] == "Charles Babbage"
 
 
+@requires_postgres
 def test_jsonb_array_elements_cast_emits_valid_postgres_type(library):
     # Canonical cast names ("datetime"/"string") are not valid PostgreSQL types;
     # the SRF path must translate them (timestamp/text) before the ``::`` cast.

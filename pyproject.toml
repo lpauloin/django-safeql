@@ -35,8 +35,8 @@ dev = [
     "pytest-xdist>=3.6",
     "pytest-cov>=5",
     "psycopg[binary]>=3.1",
-    "black==24.*",
-    "flake8>=7",
+    "pymysql>=1.1",
+    "ruff>=0.6",
     "build>=1.2",
     "twine>=5",
 ]
@@ -48,6 +48,9 @@ Issues = "https://github.com/lpauloin/django-safeql/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/django_safeql"]
 
-[tool.black]
+[tool.ruff]
 line-length = 120
-target-version = ["py310"]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

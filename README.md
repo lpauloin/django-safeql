@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="django-safeql — run untrusted or AI-generated SQL safely" width="840">
+  <img src="assets/banner.svg" alt="django-safeql: run untrusted or AI-generated SQL safely" width="840">
 </p>
 
 <p align="center">
@@ -14,22 +14,26 @@
 
 A whitelisted SQL-to-QuerySet transpiler for Django.
 
-`django-safeql` parses a restricted subset of PostgreSQL SQL, validates it
-against a schema you declare (which tables, columns, functions and operators
-are allowed), and compiles it straight into a real Django `QuerySet` — no
-raw SQL ever touches the database. It's built for situations where a SQL
-query comes from an untrusted or semi-trusted source — an LLM answering
-questions over your data, an end-user-facing query box, a saved-report
-feature — and has to run safely against your existing Django models.
+`django-safeql` takes a restricted subset of SQL, validates it against a
+schema you declare (which tables, columns, functions and operators are
+allowed), and compiles it straight into a real Django `QuerySet`. No raw SQL
+ever reaches the database. It's built for cases where a query comes from an
+untrusted or semi-trusted source, such as an LLM answering questions over
+your data, an end-user query box, or a saved-report feature, and still has
+to run safely against your existing models on PostgreSQL, SQLite or MySQL.
 
-- **No SQL injection surface** — the input is parsed into an AST and
-  compiled to ORM calls; nothing is ever executed as a raw string.
-- **Whitelist by construction** — only the tables, columns, operators,
-  functions and aggregates you declare in the schema are reachable. Anything
-  else is rejected before it gets near the database.
-- **Real QuerySets out** — the result is a normal Django `QuerySet`, so it
+- **No SQL injection surface.** The input is parsed into an AST and compiled
+  to ORM calls. Every value becomes a bound parameter, and nothing is ever
+  executed as a raw string.
+- **Whitelist by construction.** Only the tables, columns, operators,
+  functions and aggregates you declare are reachable. Anything else is
+  rejected before it gets near the database.
+- **One SQL, many backends.** The same query compiles to a `QuerySet` that
+  runs on PostgreSQL, SQLite or MySQL. A feature a backend can't run is
+  rejected up front instead of being silently mis-translated.
+- **Real QuerySets out.** The result is an ordinary Django `QuerySet`, so it
   composes with everything else in your app (pagination, further
-  `.filter()`, `select_related`, etc.).
+  `.filter()`, `select_related`, and so on).
 
 ## Install
 
@@ -37,8 +41,9 @@ feature — and has to run safely against your existing Django models.
 pip install django-safeql
 ```
 
-Requires Django ≥ 4.2 and a PostgreSQL database (some supported functions —
-JSON operators, `ARRAY_AGG`, `STRING_AGG` — are Postgres-specific).
+Requires Django ≥ 4.2. PostgreSQL is the default target and supports the full
+feature set; SQLite runs the portable subset (see
+[Database targets](#database-targets)).
 
 ## Quickstart
 
@@ -85,7 +90,7 @@ queryset = transpiler.to_queryset("""
      LIMIT 20
 """)
 
-list(queryset)  # a normal QuerySet — evaluate it however you like
+list(queryset)  # a normal QuerySet, evaluate it however you like
 ```
 
 Anything outside the declared schema is rejected before touching the
@@ -103,31 +108,67 @@ transpiler.to_queryset("DELETE FROM book WHERE id = 1")
 
 `SQLToQuerySetTranspiler` runs SQL through four stages:
 
-1. **Parse** — `sqlglot` parses the SQL text (Postgres dialect) into an
+1. **Parse.** `sqlglot` parses the SQL text (Postgres dialect) into an
    internal AST.
-2. **Annotate** — every column, join and function call is resolved against
+2. **Annotate.** Every column, join and function call is resolved against
    your `SQLTranspilerSchema` (including JSON Schema-typed JSON fields).
-3. **Validate** — anything not explicitly whitelisted (unknown table,
-   disallowed function, unsupported syntax, LIMIT above your ceiling, …)
-   raises `ValidationError` or `UnsupportedSQL`.
-4. **Codegen** — the validated AST is compiled into Django ORM constructs
+3. **Validate.** Anything not explicitly whitelisted (unknown table,
+   disallowed function, unsupported syntax, LIMIT above your ceiling, and so
+   on) raises `ValidationError` or `UnsupportedSQL`.
+4. **Codegen.** The validated AST is compiled into Django ORM constructs
    (`Q`, `F`, `Case`/`When`, `Subquery`, `Exists`, aggregates, JSON key
-   transforms, casts, date truncation, …) and returned as a `QuerySet`.
+   transforms, casts, date truncation) and returned as a `QuerySet`.
 
 ## What's supported
 
 - `SELECT` / `WHERE` / `JOIN` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT`
 - Comparison, boolean and arithmetic operators
-- Scalar aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) and Postgres
-  collection aggregates (`ARRAY_AGG`, `STRING_AGG`, `JSON_AGG`, …)
-- String functions (`LOWER`, `UPPER`, `TRIM`, `SUBSTRING`, `CONCAT`, …) and
-  date functions (`EXTRACT`, `DATE_TRUNC`, …)
+- Scalar aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) and collection
+  aggregates (`ARRAY_AGG`, `STRING_AGG`, `JSON_AGG`, `JSON_OBJECT_AGG`)
+- String functions (`LOWER`, `UPPER`, `TRIM`, `SUBSTRING`, `CONCAT`, `LEFT`,
+  `RIGHT`, `REPEAT`, `REVERSE`, `LPAD`, `RPAD`), math functions (`ABS`,
+  `CEIL`, `FLOOR`, `ROUND`, `POWER`, `SQRT`, `SIGN`, `EXP`, `LN`) and date
+  functions (`EXTRACT`, `DATE_TRUNC`)
 - Read-only JSON/JSONB access and functions, validated against a JSON
   Schema you provide per field
 - `LATERAL` joins over `jsonb_array_elements`, `EXISTS` subqueries
 
-Anything not explicitly listed — DDL, writes, arbitrary functions, joins to
-undeclared tables — is rejected.
+Anything not explicitly listed (DDL, writes, arbitrary functions, joins to
+undeclared tables) is rejected.
+
+## Database targets
+
+The transpiler targets **PostgreSQL** by default. Pass `target` to compile for
+another backend:
+
+```python
+transpiler = SQLToQuerySetTranspiler(schema, target="sqlite")
+```
+
+The target is checked against the database your `base_queryset` runs on before
+any query executes, so a mismatch fails fast instead of producing wrong SQL.
+
+Supported targets are `"postgresql"` (default), `"sqlite"` and `"mysql"`.
+PostgreSQL supports every feature. On other targets, a query that uses a feature
+the backend cannot run is rejected with a clear `ValidationError` rather than
+failing at the database. The portable subset always behaves identically:
+
+| Feature | PostgreSQL | SQLite | MySQL |
+|---|:---:|:---:|:---:|
+| `SELECT` / `WHERE` / `JOIN` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` | ✅ | ✅ | ✅ |
+| Comparison, boolean and arithmetic operators | ✅ | ✅ | ✅ |
+| Scalar aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) | ✅ | ✅ | ✅ |
+| String and date functions | ✅ | ✅ | ✅ |
+| JSON key access `->` / `->>`, `has_key` / `?\|` / `?&` | ✅ | ✅ | ✅ |
+| Casts, `CASE`, `EXISTS`, `LIKE` | ✅ | ✅ | ✅ |
+| `ILIKE` | ✅ | ✅ | ✅ |
+| JSON contains `@>` | ✅ | ❌ | ✅ |
+| `STRING_AGG`, `JSON_AGG`, `JSON_OBJECT_AGG` | ✅ | ✅ | ✅ |
+| `ARRAY_AGG` (SQLite/MySQL return a list via a JSON array) | ✅ | ✅ | ✅ |
+| `ARRAY_AGG(DISTINCT expr)` and `ARRAY_AGG(expr ORDER BY col)` | ✅ | ✅ | ❌ |
+| `jsonb_array_length` | ✅ | ✅ | ✅ |
+| Other `jsonb_*` functions and jsonpath | ✅ | ❌ | ❌ |
+| `LATERAL` over `jsonb_array_elements` | ✅ | ✅ | ❌ |
 
 ## Changelog
 
@@ -135,4 +176,4 @@ undeclared tables — is rejected.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

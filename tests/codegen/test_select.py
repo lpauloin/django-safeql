@@ -1,3 +1,5 @@
+from django.db import connection
+
 from django_safeql.transpiler import SQLToQuerySetTranspiler
 from tests.helpers import assert_sql_contains, ids
 from tests.schema_factory import make_codegen_schema
@@ -11,7 +13,7 @@ def test_select_star_returns_matching_rows(library):
 def test_select_star_expands_only_allowed_fields(library):
     schema = make_codegen_schema()
     schema.tables["book"].allowed_fields = {"id", "title", "status"}
-    transpiler = SQLToQuerySetTranspiler(schema)
+    transpiler = SQLToQuerySetTranspiler(schema, target=connection.vendor)
 
     qs = transpiler.to_queryset(f"SELECT book.* FROM book WHERE book.id = {library.d1.id}")
     assert set(list(qs)[0].keys()) == {"id", "title", "status"}

@@ -26,8 +26,10 @@ def test_case_when_inside_scalar_aggregates(library):
     assert row["total_documents"] == 4
     assert row["parsed_ok_documents"] == 3
     assert row["parsed_ko_documents"] == 1
-    assert row["avg_prints_parsed_ok"] == pytest.approx((2 + 4 + 5) / 3)
-    assert row["avg_content_length_parsed_ok"] == 200.0
+    # MySQL AVG() of integers returns a DECIMAL rounded to 4 decimals (3.6667) while
+    # PostgreSQL keeps full precision; allow for that backend difference.
+    assert row["avg_prints_parsed_ok"] == pytest.approx((2 + 4 + 5) / 3, abs=1e-3)
+    assert row["avg_content_length_parsed_ok"] == pytest.approx(200.0)
 
 
 def test_count_without_group_by(library):

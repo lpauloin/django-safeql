@@ -2,7 +2,7 @@ from django.core.exceptions import FieldDoesNotExist
 
 from django_safeql import nodes
 from django_safeql.casts import normalize_cast_type
-from django_safeql.json_schema import json_schema_type, JsonSchemaResolver
+from django_safeql.json_schema import JsonSchemaResolver, json_schema_type
 from django_safeql.schemas import SQLTranspilerSchema
 from django_safeql.scope import ScopeStack
 from django_safeql.visitor import Visitor

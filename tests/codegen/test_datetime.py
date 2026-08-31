@@ -1,14 +1,26 @@
 import datetime
 
+from django.utils import timezone
+
+from tests.testapp.models import Book
+
 # --- NOW() / CURRENT_TIMESTAMP ---
+
+# `created` is auto_now_add, so it lands microseconds before the query runs. SQLite's
+# NOW() (STRFTIME) has only millisecond precision, so a row created in the same
+# millisecond compares as "after now" in a text comparison. Age the rows past that
+# boundary to test the filter deterministically on every backend.
+A_MOMENT_AGO = datetime.timedelta(minutes=1)
 
 
 def test_now_filter_all_docs_before_now(library):
+    Book.objects.update(created=timezone.now() - A_MOMENT_AGO)
     qs = library.transpiler.to_queryset("SELECT COUNT(*) AS total FROM book WHERE book.created < NOW()")
     assert list(qs)[0]["total"] == 4
 
 
 def test_now_filter_no_docs_after_now(library):
+    Book.objects.update(created=timezone.now() - A_MOMENT_AGO)
     qs = library.transpiler.to_queryset("SELECT COUNT(*) AS total FROM book WHERE book.created > NOW()")
     assert list(qs)[0]["total"] == 0
 
@@ -217,6 +229,7 @@ def test_extract_in_aggregate_having(library):
 
 
 def test_trunc_and_extract_combined(library):
+    Book.objects.update(created=timezone.now() - A_MOMENT_AGO)
     qs = library.transpiler.to_queryset("""
         SELECT date_trunc('month', book.created) AS period,
                EXTRACT(MONTH FROM book.created) AS mo,

@@ -1,10 +1,12 @@
 import pytest
 
 from django_safeql.exceptions import ValidationError
+from tests.helpers import requires_postgres
 
 # --- Unsupported cases ---
 
 
+@requires_postgres
 def test_rejects_unsupported_set_returning_function(transpiler):
     with pytest.raises(ValidationError, match="is not supported"):
         transpiler.to_ast("SELECT book.id FROM book CROSS JOIN LATERAL generate_series(1, 10) AS n")
@@ -19,6 +21,7 @@ def test_jsonb_array_elements_passes_validation(transpiler):
     """)
 
 
+@requires_postgres
 def test_rejects_collection_aggregate_over_srf(transpiler):
     with pytest.raises(ValidationError, match="not supported over LATERAL set-returning"):
         transpiler.to_ast("""
