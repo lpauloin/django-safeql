@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.0.0] - 2026-08-31
+
+### Added
+- SQLite and MySQL support. Pass `target="sqlite"` or `target="mysql"` to
+  `SQLToQuerySetTranspiler` (the default stays `"postgresql"`) and the same
+  query compiles to a QuerySet for that backend. The target is checked against
+  your queryset's database before anything runs, and a feature the backend
+  cannot do is rejected with a clear error instead of failing at the database.
+  The README lists what each backend supports.
+- Math functions `ABS`, `CEIL`, `FLOOR`, `ROUND`, `POWER`, `SQRT`, `SIGN`,
+  `EXP`, `LN`, and string functions `LEFT`, `RIGHT`, `REPEAT`, `REVERSE`,
+  `LPAD`, `RPAD`.
+
+### Changed
+- `SQLToQuerySetTranspiler` takes an optional `target` argument. Code that does
+  not pass one keeps running against PostgreSQL as before.
+- On SQLite and MySQL, `ARRAY_AGG` returns a list built from a JSON array, since
+  those backends have no native array type. The result is still a Python list.
+- Runs on Django 4.2 through 6.1.
+
 ## [1.1.0] - 2026-08-12
 
 ### Security

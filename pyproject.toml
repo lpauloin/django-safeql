@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-safeql"
-version = "1.1.0"
-description = "A whitelisted SQL-to-QuerySet transpiler for Django — run untrusted or AI-generated SQL safely."
+version = "2.0.0"
+description = "A whitelisted SQL-to-QuerySet transpiler for Django that runs untrusted or AI-generated SQL safely."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
